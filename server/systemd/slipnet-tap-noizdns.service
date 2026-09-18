@@ -1,0 +1,14 @@
+[Unit]
+Description=SlipNet NoizDNS SOCKS Accounting Tap
+After=network.target slipgate-socks5.service
+Requires=slipgate-socks5.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 /opt/slipnet-ea/server/slipnet_socks_tap.py --listen-port 1081 --protocol NOIZDNS --stats /run/slipnet-tap-noizdns.json
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

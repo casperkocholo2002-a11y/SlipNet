@@ -238,6 +238,15 @@ class VpnRepositoryImpl @Inject constructor(
     private var prevBytesReceived = 0L
     private var prevTimestamp = 0L
 
+    // Managed EA subscription usage persists across VPN disconnects/app restarts.
+    // Bridge counters remain per-process/session; only their positive delta is
+    // added to this durable per-profile total.
+    private var managedUsageProfileId = -1L
+    private var managedUsageTotalSent = 0L
+    private var managedUsageTotalReceived = 0L
+    private var managedUsageLastSessionSent = 0L
+    private var managedUsageLastSessionReceived = 0L
+
     private var connectedProfile: ServerProfile? = null
     private var currentTunFd: ParcelFileDescriptor? = null
     private var tunnelStartException: Exception? = null
@@ -912,6 +921,12 @@ class VpnRepositoryImpl @Inject constructor(
         pfd: ParcelFileDescriptor,
         socksPortOverride: Int? = null
     ): Result<Unit> {
+        // TUN ownership is the definitive connected-profile boundary. Some
+        // transports (notably VLESS) are started directly by the VPN service
+        // and do not pass through the proxy-start helpers that already assign
+        // connectedProfile. Persist the actual DB-backed profile here so
+        // managed subscription accounting has a stable profile id/lock state.
+        connectedProfile = profile
         currentTunFd = pfd
 
         val socksPort = socksPortOverride ?: preferencesDataStore.proxyListenPort.first()
@@ -1232,7 +1247,65 @@ class VpnRepositoryImpl @Inject constructor(
         prevBytesSent = 0L
         prevBytesReceived = 0L
         prevTimestamp = 0L
+        // A new bridge session can restart its local counters from zero, while
+        // managedUsageTotal* must survive for the lifetime of the subscription.
+        managedUsageLastSessionSent = 0L
+        managedUsageLastSessionReceived = 0L
         _trafficStats.value = TrafficStats.EMPTY
+    }
+
+    private fun applyManagedSubscriptionUsage(
+        sessionSent: Long,
+        sessionReceived: Long
+    ): Pair<Long, Long> {
+        val profile = connectedProfile
+        if (
+            currentTunnelType != TunnelType.VLESS ||
+            profile == null ||
+            !profile.isLocked ||
+            profile.id <= 0L
+        ) {
+            return Pair(sessionSent, sessionReceived)
+        }
+
+        if (managedUsageProfileId != profile.id) {
+            val stored = runBlocking(Dispatchers.IO) {
+                preferencesDataStore.getManagedProfileUsage(profile.id)
+            }
+            managedUsageProfileId = profile.id
+            managedUsageTotalSent = stored.first
+            managedUsageTotalReceived = stored.second
+            managedUsageLastSessionSent = 0L
+            managedUsageLastSessionReceived = 0L
+        }
+
+        val sentDelta = if (sessionSent >= managedUsageLastSessionSent) {
+            sessionSent - managedUsageLastSessionSent
+        } else {
+            sessionSent
+        }
+        val receivedDelta = if (sessionReceived >= managedUsageLastSessionReceived) {
+            sessionReceived - managedUsageLastSessionReceived
+        } else {
+            sessionReceived
+        }
+
+        managedUsageTotalSent += sentDelta.coerceAtLeast(0L)
+        managedUsageTotalReceived += receivedDelta.coerceAtLeast(0L)
+        managedUsageLastSessionSent = sessionSent
+        managedUsageLastSessionReceived = sessionReceived
+
+        if (sentDelta > 0L || receivedDelta > 0L) {
+            runBlocking(Dispatchers.IO) {
+                preferencesDataStore.setManagedProfileUsage(
+                    profile.id,
+                    managedUsageTotalSent,
+                    managedUsageTotalReceived
+                )
+            }
+        }
+
+        return Pair(managedUsageTotalSent, managedUsageTotalReceived)
     }
 
     fun refreshTrafficStats() {
@@ -1288,6 +1361,12 @@ class VpnRepositoryImpl @Inject constructor(
                 pktSent = stats.txPackets
                 pktReceived = stats.rxPackets
             }
+        }
+
+        if (currentTunnelType == TunnelType.VLESS) {
+            val cumulative = applyManagedSubscriptionUsage(sent, received)
+            sent = cumulative.first
+            received = cumulative.second
         }
 
         // Compute speed normalized by actual elapsed time

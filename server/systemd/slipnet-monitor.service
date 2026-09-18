@@ -1,0 +1,15 @@
+[Unit]
+Description=SlipNet EA Monitor
+After=network.target xray.service cloudflared.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/slipnet-ea/server
+EnvironmentFile=/etc/slipnet-ea/server.env
+ExecStart=/usr/bin/python3 /opt/slipnet-ea/server/slipnet_monitor.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,5 +1,7 @@
 package app.slipnet.tunnel
 
+import android.os.SystemClock
+import app.slipnet.BuildConfig
 import app.slipnet.util.AppLog as Log
 import java.io.BufferedInputStream
 import java.io.ByteArrayOutputStream
@@ -8,17 +10,18 @@ import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketTimeoutException
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Future
 import java.security.SecureRandom
-import java.security.cert.X509Certificate
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocket
-import javax.net.ssl.TrustManager
-import javax.net.ssl.X509TrustManager
 
 /**
  * VLESS tunnel bridge for Cloudflare CDN with SNI fragmentation.
@@ -38,6 +41,11 @@ object VlessBridge {
     private const val TAG = "VlessBridge"
     private const val BUFFER_SIZE = 65536
     private const val TCP_CONNECT_TIMEOUT_MS = 30000
+    // Field data: healthy WS->VLESS establishment completed within ~6.1s at p100
+    // during the upload regression. Bound the pre-session read so a half-dead
+    // Cloudflare/Xray stream cannot pin a flow for 125-250 seconds.
+    private const val VLESS_SESSION_ESTABLISHMENT_TIMEOUT_MS = 12_000
+    private const val WARM_VLESS_RESPONSE_TIMEOUT_MS = 6_000
     private const val BIND_MAX_RETRIES = 10
     private const val BIND_RETRY_DELAY_MS = 200L
 
@@ -56,8 +64,69 @@ object VlessBridge {
     private var acceptorThread: Thread? = null
     private val running = AtomicBoolean(false)
     private val connectionThreads = CopyOnWriteArrayList<Thread>()
+    // Logical client/VPN boundary counters. These count each payload byte once when
+    // it crosses the local SOCKS boundary, not each time transport retries/replays it.
     private val tunnelTxBytes = AtomicLong(0)
     private val tunnelRxBytes = AtomicLong(0)
+    private val nextFlowId = AtomicLong(1)
+    private val wsMaskScratch: ThreadLocal<ByteArray> = ThreadLocal.withInitial { ByteArray(BUFFER_SIZE) }
+
+    private fun elapsedMs(startNs: Long): Long =
+        (SystemClock.elapsedRealtimeNanos() - startNs).coerceAtLeast(0L) / 1_000_000L
+
+    private data class WarmWsTunnel(
+        val socket: Socket,
+        val input: BufferedInputStream,
+        val output: OutputStream,
+        val createdAtNs: Long,
+    )
+
+    // The mandatory structural probe already pays TCP + ECH/TLS + WS upgrade.
+    // Retain exactly that validated socket for the first real flow instead of throwing
+    // the work away. No extra prewarming connection is created, so idle power stays low.
+    private val warmWsTunnel = AtomicReference<WarmWsTunnel?>(null)
+    private val warmRefillInFlight = AtomicBoolean(false)
+    private val bridgeGeneration = AtomicLong(0)
+
+    private fun closeWarmWsTunnel() {
+        warmWsTunnel.getAndSet(null)?.let { warm ->
+            try { warm.socket.close() } catch (_: Exception) {}
+        }
+    }
+
+    private fun scheduleWarmWsRefill() {
+        if (!BuildConfig.PERSONAL_BUILD || echMode != EchMode.REQUIRED || transport != "ws") return
+        if (!running.get() || warmWsTunnel.get() != null) return
+        if (!warmRefillInFlight.compareAndSet(false, true)) return
+        val generation = bridgeGeneration.get()
+        Thread({
+            var candidate: WarmWsTunnel? = null
+            try {
+                val socket = connectUpstreamTunnel(10_000, 10_000)
+                val input = BufferedInputStream(socket.getInputStream())
+                val output = socket.getOutputStream()
+                val wsKey = generateWsKey()
+                output.write(buildWsUpgradeRequest(wsKey).toByteArray(Charsets.US_ASCII))
+                output.flush()
+                val statusLine = readLine(input) ?: throw Exception("No WS response")
+                if ("101" !in statusLine) throw Exception("WS upgrade failed")
+                while (true) { val line = readLine(input) ?: break; if (line.isEmpty()) break }
+                socket.soTimeout = 0
+                candidate = WarmWsTunnel(socket, input, output, SystemClock.elapsedRealtimeNanos())
+                if (running.get() && generation == bridgeGeneration.get() && warmWsTunnel.compareAndSet(null, candidate)) {
+                    candidate = null
+                    Log.operational("WARM_WS_REFILLED")
+                }
+            } catch (_: Exception) {
+                if (running.get() && generation == bridgeGeneration.get()) {
+                    Log.operational("WARM_WS_REFILL_FAILED")
+                }
+            } finally {
+                candidate?.let { try { it.socket.close() } catch (_: Exception) {} }
+                warmRefillInFlight.set(false)
+            }
+        }, "vless-warm-refill").apply { isDaemon = true; start() }
+    }
 
     // Configuration (set before start)
     private var cdnIp: String = ""
@@ -77,6 +146,9 @@ object VlessBridge {
     private var chPaddingEnabled: Boolean = false
     private var wsHeaderObfuscation: Boolean = false
     private var wsPaddingEnabled: Boolean = false
+    private var echMode: EchMode = EchMode.DISABLED
+    @Volatile private var echConfigList: ByteArray? = null
+    private var onAuthenticatedEchConfigAccepted: ((ByteArray) -> Unit)? = null
     private val random = SecureRandom()
 
     fun start(
@@ -98,20 +170,37 @@ object VlessBridge {
         vlessSni: String = "",
         chPaddingEnabled: Boolean = false,
         wsHeaderObfuscation: Boolean = false,
-        wsPaddingEnabled: Boolean = false
+        wsPaddingEnabled: Boolean = false,
+        echMode: EchMode = EchMode.DISABLED,
+        echConfigList: ByteArray? = null,
+        onAuthenticatedEchConfigAccepted: ((ByteArray) -> Unit)? = null,
     ): Result<Unit> {
+        if (echMode != EchMode.DISABLED && security == "none") {
+            return Result.failure(IllegalArgumentException("ECH requires TLS security"))
+        }
+        if (echMode != EchMode.DISABLED && fragmentEnabled) {
+            return Result.failure(IllegalArgumentException("ECH and fragmentation must be separate routes"))
+        }
+        if (echMode == EchMode.REQUIRED && echConfigList?.isNotEmpty() != true) {
+            return Result.failure(IllegalArgumentException("ECH_REQUIRED needs a non-empty config list"))
+        }
         Log.i(TAG, "========================================")
         Log.i(TAG, "Starting VLESS Bridge")
-        Log.i(TAG, "  CDN: $cdnIp:$cdnPort")
-        Log.i(TAG, "  Domain: $serverDomain")
-        Log.i(TAG, "  UUID: ${vlessUuid.take(8)}...")
+        if (!BuildConfig.PERSONAL_BUILD) {
+            Log.i(TAG, "  CDN: $cdnIp:$cdnPort")
+            Log.i(TAG, "  Domain: $serverDomain")
+            Log.i(TAG, "  UUID: ${vlessUuid.take(8)}...")
+            if (transport == "ws") Log.i(TAG, "  WS Path: $wsPath")
+            if (fragmentStrategy == "fake" && fakeDecoyHost.isNotBlank()) Log.i(TAG, "  Fake Decoy Host: $fakeDecoyHost")
+            if (vlessSni.isNotBlank()) Log.i(TAG, "  TLS SNI: $vlessSni")
+        } else {
+            Log.i(TAG, "  Endpoint identity: [redacted-personal]")
+        }
         Log.i(TAG, "  Security: $security")
         Log.i(TAG, "  Transport: $transport")
-        if (transport == "ws") Log.i(TAG, "  WS Path: $wsPath")
         Log.i(TAG, "  Fragment: $fragmentEnabled (strategy=$fragmentStrategy, delay=${fragmentDelayMs}ms, spoofTtl=$sniSpoofTtl)")
-        if (fragmentStrategy == "fake" && fakeDecoyHost.isNotBlank()) Log.i(TAG, "  Fake Decoy Host: $fakeDecoyHost")
-        if (vlessSni.isNotBlank()) Log.i(TAG, "  TLS SNI: $vlessSni")
         Log.i(TAG, "  CH Padding: $chPaddingEnabled | WS Header Obfuscation: $wsHeaderObfuscation | WS Padding: $wsPaddingEnabled")
+        Log.i(TAG, "  ECH: $echMode")
         Log.i(TAG, "  Listen: $listenHost:$listenPort")
         Log.i(TAG, "========================================")
 
@@ -134,6 +223,9 @@ object VlessBridge {
         this.chPaddingEnabled = chPaddingEnabled
         this.wsHeaderObfuscation = wsHeaderObfuscation
         this.wsPaddingEnabled = wsPaddingEnabled
+        this.echMode = echMode
+        this.echConfigList = echConfigList?.copyOf()
+        this.onAuthenticatedEchConfigAccepted = onAuthenticatedEchConfigAccepted
 
         return try {
             // Step 1: Start fragment forwarder if enabled
@@ -193,6 +285,8 @@ object VlessBridge {
     }
 
     fun stop() {
+        bridgeGeneration.incrementAndGet()
+        closeWarmWsTunnel()
         if (!running.getAndSet(false) && fragmentForwarder == null) return
         Log.i(TAG, "Stopping VLESS Bridge")
         try { serverSocket?.close() } catch (_: Exception) {}
@@ -215,6 +309,78 @@ object VlessBridge {
         tunnelRxBytes.set(0)
     }
 
+    private fun connectRawUpstream(readTimeoutMs: Int): Socket {
+        val socket = Socket()
+        val target = if (fragmentEnabled) {
+            val fragmentPort = (serverSocket?.localPort ?: 0) + 1
+            InetSocketAddress("127.0.0.1", fragmentPort)
+        } else {
+            InetSocketAddress(cdnIp, cdnPort)
+        }
+        socket.tcpNoDelay = true
+        socket.connect(target, TCP_CONNECT_TIMEOUT_MS)
+        socket.soTimeout = readTimeoutMs
+        return socket
+    }
+
+    private fun connectUpstreamTunnel(
+        handshakeTimeoutMs: Int,
+        finalReadTimeoutMs: Int,
+        telemetryFlowId: Long = 0L,
+    ): Socket {
+        if (security == "none") return connectRawUpstream(finalReadTimeoutMs)
+        val serverName = resolveSni()
+        if (echMode != EchMode.DISABLED) {
+            if (telemetryFlowId > 0L) {
+                Log.operational("ECH_REQUIRED_STARTED", "flow" to telemetryFlowId)
+            }
+            // Take an immutable snapshot so concurrent flows either use the previous
+            // authenticated config or the newly accepted one, never a mutable shared array.
+            val activeEchConfig = echConfigList?.copyOf()
+            val request = EchConnectRequest(
+                connectHost = cdnIp,
+                port = cdnPort,
+                serverName = serverName,
+                configList = activeEchConfig,
+                connectTimeoutMs = TCP_CONNECT_TIMEOUT_MS,
+                readTimeoutMs = handshakeTimeoutMs,
+                telemetryFlowId = telemetryFlowId,
+            )
+            val acceptedConfigCallback = onAuthenticatedEchConfigAccepted
+            return when (val result = EchTlsCoordinator(
+                backend = EchBackends.current(),
+                onAuthenticatedRetryAccepted = { config ->
+                    // Promote authenticated retry material to the live bridge immediately.
+                    // Persistence is durable storage; this runtime update prevents every
+                    // subsequent SOCKS flow from paying the stale-seed retry again.
+                    val freshConfig = config.copyOf()
+                    echConfigList = freshConfig
+                    Log.operational("ECH_RUNTIME_SEED_UPDATED")
+                    acceptedConfigCallback?.invoke(freshConfig.copyOf())
+                },
+            ).connect(echMode, request)) {
+                is EchConnectResult.Connected -> result.socket.apply { soTimeout = finalReadTimeoutMs }
+                is EchConnectResult.Failed -> throw result.error
+                is EchConnectResult.Retry -> throw javax.net.ssl.SSLHandshakeException("Unexpected unconsumed ECH retry")
+            }
+        }
+
+        val raw = connectRawUpstream(handshakeTimeoutMs)
+        try {
+            val context = SSLContext.getInstance("TLS")
+            context.init(null, null, SecureRandom())
+            val ssl = context.socketFactory.createSocket(raw, serverName, cdnPort, true) as SSLSocket
+            TlsIdentity.configure(ssl, serverName)
+            ssl.startHandshake()
+            TlsIdentity.verify(ssl, serverName)
+            ssl.soTimeout = finalReadTimeoutMs
+            return ssl
+        } catch (error: Throwable) {
+            try { raw.close() } catch (_: Exception) {}
+            throw error
+        }
+    }
+
     /**
      * Structural probe: verifies the parts of the connection that depend on
      * *your* config — TCP to the CDN, TLS (correct SNI), and the WebSocket
@@ -232,41 +398,12 @@ object VlessBridge {
      */
     fun probe(timeoutMs: Int = 10_000): Result<Unit> {
         if (!isRunning()) return Result.failure(IllegalStateException("VlessBridge not running"))
-        var raw: Socket? = null
         var tunnel: Socket? = null
+        var retainedAsWarm = false
         return try {
-            val sock = Socket()
-            raw = sock
-            sock.tcpNoDelay = true
-            val target = if (fragmentEnabled) {
-                val fragPort = (serverSocket?.localPort ?: 0) + 1
-                InetSocketAddress("127.0.0.1", fragPort)
-            } else {
-                InetSocketAddress(cdnIp, cdnPort)
-            }
-            sock.connect(target, TCP_CONNECT_TIMEOUT_MS)
-            sock.soTimeout = timeoutMs
-
-            val tIn: InputStream
-            val tOut: OutputStream
-            if (security == "none") {
-                tunnel = sock
-                tIn = BufferedInputStream(sock.getInputStream())
-                tOut = sock.getOutputStream()
-            } else {
-                val sni = resolveSni()
-                val sslCtx = SSLContext.getInstance("TLS")
-                sslCtx.init(null, trustAllManagers(), SecureRandom())
-                val ssl = sslCtx.socketFactory.createSocket(sock, sni, cdnPort, true) as SSLSocket
-                ssl.sslParameters = ssl.sslParameters.apply {
-                    serverNames = listOf(SNIHostName(sni))
-                }
-                ssl.soTimeout = timeoutMs
-                ssl.startHandshake()
-                tunnel = ssl
-                tIn = BufferedInputStream(ssl.getInputStream())
-                tOut = ssl.getOutputStream()
-            }
+            tunnel = connectUpstreamTunnel(timeoutMs, timeoutMs)
+            val tIn = BufferedInputStream(tunnel.getInputStream())
+            val tOut = tunnel.getOutputStream()
 
             // For WS transport, verify the upgrade completes — that confirms
             // the WS path is correct and the Worker is accepting clients.
@@ -280,6 +417,16 @@ object VlessBridge {
                 if ("101" !in statusLine) throw Exception("WS upgrade failed: $statusLine (check wsPath)")
                 // Drain response headers so the server finishes its write.
                 while (true) { val line = readLine(tIn) ?: break; if (line.isEmpty()) break }
+
+                if (BuildConfig.PERSONAL_BUILD && echMode == EchMode.REQUIRED) {
+                    tunnel.soTimeout = 0
+                    val warm = WarmWsTunnel(tunnel, tIn, tOut, SystemClock.elapsedRealtimeNanos())
+                    warmWsTunnel.getAndSet(warm)?.let { previous ->
+                        try { previous.socket.close() } catch (_: Exception) {}
+                    }
+                    retainedAsWarm = true
+                    Log.operational("WARM_WS_STORED")
+                }
             }
 
             Log.i(TAG, "VLESS probe succeeded (structural)")
@@ -288,14 +435,128 @@ object VlessBridge {
             Log.w(TAG, "VLESS probe failed: ${e.javaClass.simpleName} ${e.message}")
             Result.failure(e)
         } finally {
+            if (!retainedAsWarm) try { tunnel?.close() } catch (_: Exception) {}
+        }
+    }
+
+
+    /**
+     * Authenticated backend probe for Personal EA.
+     *
+     * The structural probe above intentionally stops after WS 101 so its socket
+     * can be retained as the first-flow warm tunnel. This second short-lived
+     * connection verifies the VLESS UUID/backend path itself by asking Xray to
+     * open a TCP stream to the server-local authenticated monitor endpoint.
+     */
+    fun probeAuthenticated(timeoutMs: Int = 10_000): Result<Unit> {
+        if (!isRunning()) return Result.failure(IllegalStateException("VlessBridge not running"))
+        var tunnel: Socket? = null
+        return try {
+            tunnel = connectUpstreamTunnel(timeoutMs, timeoutMs)
+            tunnel.soTimeout = timeoutMs
+            val input = BufferedInputStream(tunnel.getInputStream())
+            val output = tunnel.getOutputStream()
+
+            if (transport == "ws") {
+                val wsKey = generateWsKey()
+                output.write(buildWsUpgradeRequest(wsKey).toByteArray(Charsets.US_ASCII))
+                output.flush()
+                val statusLine = readLine(input)
+                    ?: throw Exception("No WS response during authenticated probe")
+                if ("101" !in statusLine) {
+                    throw Exception("WS upgrade failed during authenticated probe: $statusLine")
+                }
+                while (true) {
+                    val line = readLine(input) ?: break
+                    if (line.isEmpty()) break
+                }
+
+                val request = buildVlessRequest(parseUUID(vlessUuid), "127.0.0.1", 8080)
+                val probePayload = (
+                    "GET / HTTP/1.1\r\n" +
+                    "Host: localhost\r\n" +
+                    "Connection: close\r\n\r\n"
+                ).toByteArray(Charsets.US_ASCII)
+                writeWsFrame(output, request + probePayload)
+
+                val b0 = input.read()
+                val b1 = input.read()
+                if (b0 < 0 || b1 < 0) throw Exception("No VLESS auth response")
+                val opcode = b0 and 0x0F
+                if (opcode == 0x08) throw Exception("VLESS auth rejected (WS close)")
+
+                val masked = (b1 and 0x80) != 0
+                var payloadLen = (b1 and 0x7F).toLong()
+                if (payloadLen == 126L) {
+                    val h = input.read(); val l = input.read()
+                    if (h < 0 || l < 0) throw Exception("Truncated VLESS auth frame")
+                    payloadLen = ((h shl 8) or l).toLong()
+                } else if (payloadLen == 127L) {
+                    var len = 0L
+                    repeat(8) {
+                        val b = input.read()
+                        if (b < 0) throw Exception("Truncated VLESS auth frame")
+                        len = (len shl 8) or b.toLong()
+                    }
+                    payloadLen = len
+                }
+                if (payloadLen > 4096L) throw Exception("Unexpected VLESS auth frame size: $payloadLen")
+
+                var maskKey: ByteArray? = null
+                if (masked) {
+                    maskKey = ByteArray(4)
+                    readFully(input, maskKey)
+                }
+                val payload = ByteArray(payloadLen.toInt())
+                if (payload.isNotEmpty()) {
+                    readFully(input, payload)
+                    if (maskKey != null) {
+                        for (i in payload.indices) {
+                            payload[i] = (payload[i].toInt() xor maskKey[i % 4].toInt()).toByte()
+                        }
+                    }
+                }
+                if (payload.size < 2) throw Exception("Invalid VLESS auth response")
+                if (payload[0] != VLESS_VERSION) throw Exception("Unexpected VLESS response version")
+                val addonsLen = payload[1].toInt() and 0xFF
+                if (2 + addonsLen > payload.size) throw Exception("Truncated VLESS auth response")
+            } else {
+                val request = buildVlessRequest(parseUUID(vlessUuid), "127.0.0.1", 8080)
+                val probePayload = (
+                    "GET / HTTP/1.1\r\n" +
+                    "Host: localhost\r\n" +
+                    "Connection: close\r\n\r\n"
+                ).toByteArray(Charsets.US_ASCII)
+                output.write(request)
+                output.write(probePayload)
+                output.flush()
+                val version = input.read()
+                val addonsLen = input.read()
+                if (version < 0 || addonsLen < 0) throw Exception("No VLESS auth response")
+                if (version != VLESS_VERSION.toInt()) throw Exception("Unexpected VLESS response version")
+                if (addonsLen > 0) {
+                    val addons = ByteArray(addonsLen)
+                    readFully(input, addons)
+                }
+            }
+
+            Log.operational("VLESS_AUTH_PROBE_OK")
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Log.operational("VLESS_AUTH_PROBE_FAILED")
+            Log.w(TAG, "VLESS authenticated probe failed: ${e.javaClass.simpleName} ${e.message}")
+            Result.failure(e)
+        } finally {
             try { tunnel?.close() } catch (_: Exception) {}
-            try { raw?.close() } catch (_: Exception) {}
         }
     }
 
     // ── SOCKS5 Handling ──────────────────────────────────────────────
 
     private fun handleSocks5Connection(client: Socket) {
+        val flowId = nextFlowId.getAndIncrement()
+        val acceptedNs = SystemClock.elapsedRealtimeNanos()
+        Log.operational("SOCKS_ACCEPT", "flow" to flowId)
         try {
             Log.d(TAG, "SOCKS5 connection from ${client.remoteSocketAddress}")
             client.tcpNoDelay = true
@@ -370,15 +631,38 @@ object VlessBridge {
             // This avoids a deadlock where the remote server waits for data before responding.
             val firstPayload = ByteArray(BUFFER_SIZE)
             val firstPayloadLen = input.read(firstPayload)
-            val initialData = if (firstPayloadLen > 0) firstPayload.copyOf(firstPayloadLen) else ByteArray(0)
+            if (firstPayloadLen <= 0) {
+                Log.operational("FLOW_NO_PAYLOAD", "flow" to flowId, "ms" to elapsedMs(acceptedNs))
+                return
+            }
+            val initialData = firstPayload.copyOf(firstPayloadLen)
+            // Account at the client/VPN boundary exactly once. A stale warm socket may
+            // replay this buffered payload on a fresh upstream, but that transport retry
+            // is not new user traffic and must not inflate the UI counter.
+            tunnelTxBytes.addAndGet(initialData.size.toLong())
+            val firstPayloadNs = SystemClock.elapsedRealtimeNanos()
+            Log.operational(
+                "FIRST_PAYLOAD_RECEIVED",
+                "flow" to flowId,
+                "accept_to_payload_ms" to elapsedMs(acceptedNs),
+                "bytes" to initialData.size.toLong(),
+            )
             logd("First payload from client: ${initialData.size} bytes for $destHost:$destPort")
 
             // Establish VLESS tunnel to destination
-            handleVlessConnect(client, destHost, destPort, initialData)
+            handleVlessConnect(client, input, destHost, destPort, initialData, flowId, acceptedNs, firstPayloadNs)
 
         } catch (e: Exception) {
+            Log.operational("FLOW_FAILED_SOCKS", "flow" to flowId, "ms" to elapsedMs(acceptedNs))
             Log.e(TAG, "SOCKS5 error: ${e.message}")
         } finally {
+            Log.operational(
+                "FLOW_CLOSED",
+                "flow" to flowId,
+                "ms" to elapsedMs(acceptedNs),
+                "tx_total" to tunnelTxBytes.get(),
+                "rx_total" to tunnelRxBytes.get(),
+            )
             try { client.close() } catch (_: Exception) {}
             connectionThreads.remove(Thread.currentThread())
         }
@@ -386,55 +670,71 @@ object VlessBridge {
 
     // ── VLESS Connection ─────────────────────────────────────────────
 
-    private fun handleVlessConnect(client: Socket, destHost: String, destPort: Int, initialData: ByteArray = ByteArray(0)) {
-        // Step 1: TCP connect (through fragment forwarder if enabled, or direct to CDN)
-        val raw: Socket
-        if (fragmentEnabled) {
-            val fragmentPort = (serverSocket?.localPort ?: 0) + 1
-            raw = Socket()
-            raw.connect(InetSocketAddress("127.0.0.1", fragmentPort), TCP_CONNECT_TIMEOUT_MS)
-        } else {
-            raw = Socket()
-            raw.connect(InetSocketAddress(cdnIp, cdnPort), TCP_CONNECT_TIMEOUT_MS)
-        }
-        raw.tcpNoDelay = true
-
+    private fun handleVlessConnect(
+        client: Socket,
+        clientInput: InputStream,
+        destHost: String,
+        destPort: Int,
+        initialData: ByteArray = ByteArray(0),
+        flowId: Long,
+        acceptedNs: Long,
+        firstPayloadNs: Long,
+    ) {
+        var tunnelSocket: Socket? = null
         try {
-            // Step 2: TLS handshake (or skip for security=none)
-            val tunnelIn: InputStream
-            val tunnelOut: OutputStream
-            val tunnelSocket: Socket
-
-            if (security == "none") {
-                logd("Skipping TLS (security=none)")
-                tunnelSocket = raw
-                tunnelIn = BufferedInputStream(raw.getInputStream())
-                tunnelOut = raw.getOutputStream()
-            } else {
-                val sni = resolveSni()
-                val sslCtx = SSLContext.getInstance("TLS")
-                sslCtx.init(null, trustAllManagers(), SecureRandom())
-                val sslSocket = sslCtx.socketFactory.createSocket(raw, sni, cdnPort, true) as SSLSocket
-                sslSocket.sslParameters = sslSocket.sslParameters.apply {
-                    serverNames = listOf(SNIHostName(sni))
+            if (transport == "ws") {
+                val warm = warmWsTunnel.getAndSet(null)
+                scheduleWarmWsRefill()
+                if (warm != null) {
+                    tunnelSocket = warm.socket
+                    Log.operational(
+                        "WARM_WS_REUSED",
+                        "flow" to flowId,
+                        "age_ms" to elapsedMs(warm.createdAtNs),
+                        "from_accept_ms" to elapsedMs(acceptedNs),
+                    )
+                    try {
+                        handleVlessWs(
+                            client, clientInput, warm.socket, warm.input, warm.output, destHost, destPort,
+                            initialData, flowId, acceptedNs, wsAlreadyUpgraded = true,
+                        )
+                        return
+                    } catch (_: Exception) {
+                        Log.operational("WARM_WS_REUSE_FAILED", "flow" to flowId, "ms" to elapsedMs(acceptedNs))
+                        try { warm.socket.close() } catch (_: Exception) {}
+                        tunnelSocket = null
+                    }
                 }
-                sslSocket.startHandshake()
-                Log.d(TAG, "TLS handshake complete (${sslSocket.session.protocol})")
-                tunnelSocket = sslSocket
-                tunnelIn = BufferedInputStream(sslSocket.getInputStream())
-                tunnelOut = sslSocket.getOutputStream()
+            }
+
+            val upstreamStartNs = SystemClock.elapsedRealtimeNanos()
+            tunnelSocket = connectUpstreamTunnel(
+                handshakeTimeoutMs = 15_000,
+                finalReadTimeoutMs = VLESS_SESSION_ESTABLISHMENT_TIMEOUT_MS,
+                telemetryFlowId = flowId,
+            )
+            Log.operational(
+                "TLS_ECH_COMPLETE",
+                "flow" to flowId,
+                "upstream_ms" to elapsedMs(upstreamStartNs),
+                "payload_to_tls_ms" to elapsedMs(firstPayloadNs),
+            )
+            val tunnelIn = BufferedInputStream(tunnelSocket.getInputStream())
+            val tunnelOut = tunnelSocket.getOutputStream()
+            if (tunnelSocket is SSLSocket) {
+                Log.d(TAG, "TLS handshake complete (${tunnelSocket.session.protocol})")
             }
 
             if (transport == "tcp") {
                 handleVlessTcp(client, tunnelIn, tunnelOut, destHost, destPort, initialData)
             } else {
-                handleVlessWs(client, tunnelSocket, tunnelIn, tunnelOut, destHost, destPort, initialData)
+                handleVlessWs(client, clientInput, tunnelSocket, tunnelIn, tunnelOut, destHost, destPort, initialData, flowId, acceptedNs)
             }
-
         } catch (e: Exception) {
+            Log.operational("FLOW_FAILED_UPSTREAM_OR_SESSION", "flow" to flowId, "ms" to elapsedMs(acceptedNs))
             Log.e(TAG, "VLESS connect error for $destHost:$destPort: ${e.message}")
         } finally {
-            try { raw.close() } catch (_: Exception) {}
+            try { tunnelSocket?.close() } catch (_: Exception) {}
         }
     }
 
@@ -469,11 +769,6 @@ object VlessBridge {
             readFully(tunnelIn, addons)
         }
 
-        // Only count the buffered payload as "transferred" once the handshake
-        // has actually succeeded — otherwise a misconfigured tunnel racks up
-        // phantom upload bytes on bytes that never reach a real server.
-        if (initialData.isNotEmpty()) tunnelTxBytes.addAndGet(initialData.size.toLong())
-
         logd("VLESS/TCP session established for $destHost:$destPort")
 
         // Raw bidirectional relay (no WS framing)
@@ -485,30 +780,55 @@ object VlessBridge {
      *
      * WebSocket transport: WS upgrade + VLESS header as WS frame.
      */
-    private fun handleVlessWs(client: Socket, tunnelSocket: Socket, tunnelIn: InputStream, tunnelOut: OutputStream, destHost: String, destPort: Int, initialData: ByteArray = ByteArray(0)) {
-        val wsKey = generateWsKey()
-        val upgrade = buildWsUpgradeRequest(wsKey)
-        tunnelOut.write(upgrade.toByteArray(Charsets.US_ASCII))
-        tunnelOut.flush()
+    private fun handleVlessWs(
+        client: Socket,
+        clientInput: InputStream,
+        tunnelSocket: Socket,
+        tunnelIn: InputStream,
+        tunnelOut: OutputStream,
+        destHost: String,
+        destPort: Int,
+        initialData: ByteArray = ByteArray(0),
+        flowId: Long,
+        acceptedNs: Long,
+        wsAlreadyUpgraded: Boolean = false,
+    ) {
+        if (!wsAlreadyUpgraded) {
+            val wsKey = generateWsKey()
+            val upgrade = buildWsUpgradeRequest(wsKey)
+            tunnelOut.write(upgrade.toByteArray(Charsets.US_ASCII))
+            tunnelOut.flush()
 
-        // Read and log the full 101 response
-        val statusLine = readLine(tunnelIn)
-        if (statusLine == null || "101" !in statusLine) {
-            Log.w(TAG, "WebSocket upgrade failed: $statusLine")
-            tunnelSocket.close()
-            return
+            // Read and log the full 101 response
+            val statusLine = readLine(tunnelIn)
+            if (statusLine == null || "101" !in statusLine) {
+                Log.operational("FLOW_FAILED_WS_UPGRADE", "flow" to flowId, "ms" to elapsedMs(acceptedNs))
+                Log.w(TAG, "WebSocket upgrade failed: $statusLine")
+                tunnelSocket.close()
+                return
+            }
+            val responseHeaders = mutableListOf(statusLine)
+            while (true) {
+                val line = readLine(tunnelIn) ?: break
+                if (line.isEmpty()) break
+                responseHeaders.add(line)
+            }
+            Log.operational("WS_101_COMPLETE", "flow" to flowId, "from_accept_ms" to elapsedMs(acceptedNs))
+            Log.d(TAG, "WS upgrade for $destHost:$destPort — ${responseHeaders.joinToString(" | ")}")
         }
-        val responseHeaders = mutableListOf(statusLine)
-        while (true) {
-            val line = readLine(tunnelIn) ?: break
-            if (line.isEmpty()) break
-            responseHeaders.add(line)
+
+        // Warm sockets must remain replay-safe: if one is stale, do not consume any
+        // additional client bytes before falling back to a fresh connection. Fresh
+        // sockets can safely pump upstream while waiting for the VLESS response; this
+        // avoids a pre-session deadlock when the destination needs more than the first
+        // buffered chunk before it produces a response.
+        tunnelSocket.soTimeout = if (wsAlreadyUpgraded) {
+            WARM_VLESS_RESPONSE_TIMEOUT_MS
+        } else {
+            VLESS_SESSION_ESTABLISHMENT_TIMEOUT_MS
         }
-        Log.d(TAG, "WS upgrade for $destHost:$destPort — ${responseHeaders.joinToString(" | ")}")
 
         // Send VLESS header + initial payload bundled in a single WS frame.
-        // The remote server needs the first payload (e.g., TLS ClientHello) to respond,
-        // which triggers the Worker to send back the VLESS response.
         val uuid = parseUUID(vlessUuid)
         val vlessHeader = buildVlessRequest(uuid, destHost, destPort)
         val bundled = if (initialData.isNotEmpty()) {
@@ -519,14 +839,65 @@ object VlessBridge {
         Log.d(TAG, "VLESS request (${vlessHeader.size}b header + ${initialData.size}b payload) for $destHost:$destPort")
         writeWsFrame(tunnelOut, bundled)
 
-        // Read server response — log raw bytes for debugging
-        val b0 = tunnelIn.read()
-        if (b0 < 0) throw Exception("No VLESS response (EOF)")
-        val b1 = tunnelIn.read()
-        if (b1 < 0) throw Exception("No VLESS response (EOF after b0=${String.format("%02x", b0)})")
+        val preResponseUpload = if (!wsAlreadyUpgraded) {
+            startWsUploadPump(clientInput, tunnelOut).also {
+                Log.operational("PRE_RESPONSE_UPLOAD_STARTED", "flow" to flowId)
+            }
+        } else null
 
-        // Only credit the buffered payload once the server actually answered.
-        if (initialData.isNotEmpty()) tunnelTxBytes.addAndGet(initialData.size.toLong())
+        // Read server response. Some destinations do not produce downstream data until
+        // a large upload finishes, and Xray can defer the VLESS response header with it.
+        // Fresh sockets therefore extend the wait while upload bytes are still making
+        // progress. A true no-progress stall still fails after the bounded timeout.
+        var b0: Int
+        var b1: Int
+        while (true) {
+            try {
+                b0 = tunnelIn.read()
+                if (b0 < 0) {
+                    Log.operational("FLOW_FAILED_VLESS_RESPONSE", "flow" to flowId, "ms" to elapsedMs(acceptedNs))
+                    throw Exception("No VLESS response (EOF)")
+                }
+                b1 = tunnelIn.read()
+                if (b1 < 0) {
+                    Log.operational("FLOW_FAILED_VLESS_RESPONSE", "flow" to flowId, "ms" to elapsedMs(acceptedNs))
+                    throw Exception("No VLESS response (EOF after b0=${String.format("%02x", b0)})")
+                }
+                break
+            } catch (timeout: SocketTimeoutException) {
+                val canExtendFreshWait = if (!wsAlreadyUpgraded && preResponseUpload != null) {
+                    val completed = preResponseUpload.completedNs.get()
+                    val anchor = if (completed > 0L) {
+                        maxOf(preResponseUpload.lastProgressNs.get(), completed)
+                    } else {
+                        preResponseUpload.lastProgressNs.get()
+                    }
+                    elapsedMs(anchor) < VLESS_SESSION_ESTABLISHMENT_TIMEOUT_MS
+                } else false
+
+                if (canExtendFreshWait) {
+                    Log.operational(
+                        "FLOW_VLESS_RESPONSE_WAIT_EXTENDED",
+                        "flow" to flowId,
+                        "ms" to elapsedMs(acceptedNs),
+                    )
+                    continue
+                }
+
+                Log.operational(
+                    "FLOW_VLESS_RESPONSE_TIMEOUT",
+                    "flow" to flowId,
+                    "ms" to elapsedMs(acceptedNs),
+                    "warm" to if (wsAlreadyUpgraded) 1L else 0L,
+                )
+                preResponseUpload?.let { stopWsUploadPump(it) }
+                throw timeout
+            } catch (error: Throwable) {
+                preResponseUpload?.let { stopWsUploadPump(it) }
+                throw error
+            }
+        }
+
         val opcode = b0 and 0x0F
         val fin = (b0 and 0x80) != 0
         val masked = (b1 and 0x80) != 0
@@ -559,19 +930,30 @@ object VlessBridge {
         Log.d(TAG, "VLESS response (${payload.size}b): ${payload.take(16).joinToString(" ") { String.format("%02x", it) }} for $destHost:$destPort")
 
         if (payload.size < 2) throw Exception("Invalid VLESS response (${payload.size} bytes)")
+        // Establishment is complete. Do not impose a read deadline on the live tunnel.
+        tunnelSocket.soTimeout = 0
         val respAddonsLen = payload[1].toInt() and 0xFF
         val responsePayloadOffset = 2 + respAddonsLen
+        var firstUsefulByteDelivered = false
         if (responsePayloadOffset < payload.size) {
             val initialData = payload.copyOfRange(responsePayloadOffset, payload.size)
             client.getOutputStream().write(initialData)
             client.getOutputStream().flush()
             tunnelRxBytes.addAndGet(initialData.size.toLong())
+            firstUsefulByteDelivered = true
+            Log.operational(
+                "FIRST_USEFUL_BYTE",
+                "flow" to flowId,
+                "from_accept_ms" to elapsedMs(acceptedNs),
+                "bytes" to initialData.size.toLong(),
+            )
         }
 
+        Log.operational("VLESS_SESSION_ESTABLISHED", "flow" to flowId, "from_accept_ms" to elapsedMs(acceptedNs))
         Log.i(TAG, "VLESS/WS session established for $destHost:$destPort")
 
         // Bidirectional relay with WS framing
-        relayVless(client, tunnelIn, tunnelOut)
+        relayVless(client, clientInput, tunnelIn, tunnelOut, flowId, acceptedNs, firstUsefulByteDelivered, preResponseUpload)
     }
 
     /**
@@ -589,9 +971,11 @@ object VlessBridge {
                 while (!Thread.currentThread().isInterrupted) {
                     val n = clientIn.read(buf)
                     if (n <= 0) break
+                    // Count what the client handed to the VPN, independent of whether
+                    // the current upstream write later succeeds or is retried.
+                    tunnelTxBytes.addAndGet(n.toLong())
                     tlsOut.write(buf, 0, n)
                     tlsOut.flush()
-                    tunnelTxBytes.addAndGet(n.toLong())
                 }
             } catch (_: Exception) {}
         }
@@ -653,30 +1037,78 @@ object VlessBridge {
         return buf.toByteArray()
     }
 
+    private data class WsUploadPump(
+        val executor: ExecutorService,
+        val future: Future<*>,
+        val lastProgressNs: AtomicLong,
+        val completedNs: AtomicLong,
+    )
+
+    private fun startWsUploadPump(clientInput: InputStream, wsOutput: OutputStream): WsUploadPump {
+        val executor = Executors.newSingleThreadExecutor()
+        val lastProgressNs = AtomicLong(SystemClock.elapsedRealtimeNanos())
+        val completedNs = AtomicLong(0L)
+        lateinit var pump: WsUploadPump
+        val future = executor.submit {
+            var readBytes = 0L
+            var writtenBytes = 0L
+            var frames = 0L
+            try {
+                val buf = ByteArray(BUFFER_SIZE)
+                while (!Thread.currentThread().isInterrupted) {
+                    val n = clientInput.read(buf)
+                    if (n <= 0) break
+                    readBytes += n.toLong()
+                    // Count once at SOCKS ingress. If this upstream dies after the read,
+                    // a transport replay/fallback must not count these same bytes twice.
+                    tunnelTxBytes.addAndGet(n.toLong())
+                    synchronized(wsOutput) {
+                        writeWsFrame(wsOutput, buf, length = n)
+                    }
+                    writtenBytes += n.toLong()
+                    frames++
+                    lastProgressNs.set(SystemClock.elapsedRealtimeNanos())
+                }
+            } catch (error: Exception) {
+                Log.operational(
+                    "WS_UPLOAD_PUMP_FAILED",
+                    "read" to readBytes,
+                    "written" to writtenBytes,
+                    "frames" to frames,
+                )
+                Log.w(TAG, "WS upload pump failed: ${error.javaClass.simpleName}")
+            } finally {
+                completedNs.compareAndSet(0L, SystemClock.elapsedRealtimeNanos())
+            }
+        }
+        pump = WsUploadPump(executor, future, lastProgressNs, completedNs)
+        return pump
+    }
+
+    private fun stopWsUploadPump(pump: WsUploadPump) {
+        pump.future.cancel(true)
+        pump.executor.shutdownNow()
+    }
+
     /**
      * Relay data between client and WebSocket-framed VLESS tunnel.
      * Client side is raw TCP; tunnel side uses WebSocket binary frames.
      */
-    private fun relayVless(client: Socket, wsInput: InputStream, wsOutput: OutputStream) {
-        val threadCount = if (wsPaddingEnabled) 3 else 2
-        val executor = Executors.newFixedThreadPool(threadCount)
-        val clientIn = client.getInputStream()
+    private fun relayVless(
+        client: Socket,
+        clientInput: InputStream,
+        wsInput: InputStream,
+        wsOutput: OutputStream,
+        flowId: Long,
+        acceptedNs: Long,
+        firstUsefulByteAlreadyDelivered: Boolean,
+        preResponseUpload: WsUploadPump?,
+    ) {
         val clientOut = client.getOutputStream()
-
-        // Client -> VLESS (wrap in WS frames)
-        val f1 = executor.submit {
-            try {
-                val buf = ByteArray(BUFFER_SIZE)
-                while (!Thread.currentThread().isInterrupted) {
-                    val n = clientIn.read(buf)
-                    if (n <= 0) break
-                    synchronized(wsOutput) {
-                        writeWsFrame(wsOutput, buf.copyOf(n))
-                    }
-                    tunnelTxBytes.addAndGet(n.toLong())
-                }
-            } catch (_: Exception) {}
-        }
+        val firstUsefulByteDelivered = AtomicBoolean(firstUsefulByteAlreadyDelivered)
+        val upload = preResponseUpload ?: startWsUploadPump(clientInput, wsOutput)
+        val executor = Executors.newFixedThreadPool(if (wsPaddingEnabled) 2 else 1)
+        val f1 = upload.future
 
         // VLESS -> Client (unwrap WS frames)
         val f2 = executor.submit {
@@ -687,12 +1119,22 @@ object VlessBridge {
                     clientOut.write(frame)
                     clientOut.flush()
                     tunnelRxBytes.addAndGet(frame.size.toLong())
+                    if (firstUsefulByteDelivered.compareAndSet(false, true)) {
+                        Log.operational(
+                            "FIRST_USEFUL_BYTE",
+                            "flow" to flowId,
+                            "from_accept_ms" to elapsedMs(acceptedNs),
+                            "bytes" to frame.size.toLong(),
+                        )
+                    }
                 }
             } catch (_: Exception) {}
         }
 
         // Cover traffic: send random-size WS ping frames at random intervals
+        val coverPingCount = AtomicLong(0)
         val f3 = if (wsPaddingEnabled) executor.submit {
+            Log.operational("COVER_TRAFFIC_STARTED", "flow" to flowId)
             try {
                 while (!Thread.currentThread().isInterrupted) {
                     val delay = 500 + random.nextInt(2000) // 0.5-2.5s between pings
@@ -703,14 +1145,24 @@ object VlessBridge {
                     synchronized(wsOutput) {
                         writeWsFrame(wsOutput, pingPayload, opcode = 0x09)
                     }
+                    coverPingCount.incrementAndGet()
                 }
             } catch (_: Exception) {}
         } else null
 
         try { f1.get() } catch (_: Exception) {}
         try { f2.get() } catch (_: Exception) {}
+        f3?.cancel(true)
         try { f3?.get() } catch (_: Exception) {}
+        stopWsUploadPump(upload)
         executor.shutdownNow()
+        if (wsPaddingEnabled) {
+            Log.operational(
+                "COVER_TRAFFIC_STOPPED",
+                "flow" to flowId,
+                "pings" to coverPingCount.get(),
+            )
+        }
     }
 
     // ── WebSocket Framing (RFC 6455) ─────────────────────────────────
@@ -719,39 +1171,57 @@ object VlessBridge {
      * Write a WebSocket frame with masking (client must mask).
      * Default opcode 0x02 = binary, 0x09 = ping.
      */
-    private fun writeWsFrame(out: OutputStream, payload: ByteArray, opcode: Int = 0x02) {
-        val header = ByteArrayOutputStream()
-        // FIN + opcode
-        header.write(0x80 or opcode)
-        // Mask bit set (client) + length
-        val len = payload.size
+    private fun writeWsFrame(
+        out: OutputStream,
+        payload: ByteArray,
+        length: Int = payload.size,
+        opcode: Int = 0x02,
+    ) {
+        require(length in 0..payload.size)
+        val len = length
+
+        // Build the RFC 6455 client header without ByteArrayOutputStream allocation.
+        val header = ByteArray(14)
+        var h = 0
+        header[h++] = (0x80 or opcode).toByte()
         when {
-            len <= 125 -> header.write(0x80 or len)
+            len <= 125 -> header[h++] = (0x80 or len).toByte()
             len <= 65535 -> {
-                header.write(0x80 or 126)
-                header.write(len shr 8 and 0xFF)
-                header.write(len and 0xFF)
+                header[h++] = (0x80 or 126).toByte()
+                header[h++] = (len ushr 8).toByte()
+                header[h++] = len.toByte()
             }
             else -> {
-                header.write(0x80 or 127)
-                for (i in 7 downTo 0) {
-                    header.write((len.toLong() shr (i * 8) and 0xFF).toInt())
-                }
+                header[h++] = (0x80 or 127).toByte()
+                val longLen = len.toLong()
+                for (i in 7 downTo 0) header[h++] = (longLen ushr (i * 8)).toByte()
             }
         }
-        // Masking key
-        val mask = ByteArray(4)
-        SecureRandom().nextBytes(mask)
-        header.write(mask)
 
-        // Masked payload
-        val masked = ByteArray(len)
+        // One shared SecureRandom supplies unpredictable masks; do not instantiate a
+        // provider/PRNG for every frame. The output stream is already serialized per flow.
+        val mask = random.nextInt()
+        val m0 = mask ushr 24 and 0xff
+        val m1 = mask ushr 16 and 0xff
+        val m2 = mask ushr 8 and 0xff
+        val m3 = mask and 0xff
+        header[h++] = m0.toByte()
+        header[h++] = m1.toByte()
+        header[h++] = m2.toByte()
+        header[h++] = m3.toByte()
+
+        var masked = wsMaskScratch.get() ?: ByteArray(BUFFER_SIZE).also(wsMaskScratch::set)
+        if (masked.size < len) {
+            masked = ByteArray(len)
+            wsMaskScratch.set(masked)
+        }
         for (i in 0 until len) {
-            masked[i] = (payload[i].toInt() xor mask[i % 4].toInt()).toByte()
+            val key = when (i and 3) { 0 -> m0; 1 -> m1; 2 -> m2; else -> m3 }
+            masked[i] = (payload[i].toInt() xor key).toByte()
         }
 
-        out.write(header.toByteArray())
-        out.write(masked)
+        out.write(header, 0, h)
+        out.write(masked, 0, len)
         out.flush()
     }
 
@@ -917,12 +1387,6 @@ object VlessBridge {
         result.addAll(right)
         return result
     }
-
-    private fun trustAllManagers(): Array<TrustManager> = arrayOf(object : X509TrustManager {
-        override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) {}
-        override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) {}
-        override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
-    })
 
     private fun bindServerSocket(host: String, port: Int): ServerSocket {
         for (attempt in 0 until BIND_MAX_RETRIES) {

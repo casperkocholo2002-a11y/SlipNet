@@ -15,7 +15,8 @@ data class AppUpdate(
 
 object UpdateChecker {
     private const val TAG = "UpdateChecker"
-    private const val GITHUB_API = "https://api.github.com/repos/anonvector/SlipNet/releases/latest"
+    private val updateApiUrl: String
+        get() = app.slipnet.BuildConfig.UPDATE_API_URL.trim()
     private const val TIMEOUT_MS = 10_000
     // Only check once per 12 hours
     const val CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000L
@@ -26,7 +27,12 @@ object UpdateChecker {
      */
     suspend fun check(currentVersionName: String): AppUpdate? = withContext(Dispatchers.IO) {
         try {
-            val conn = URL(GITHUB_API).openConnection() as HttpURLConnection
+            val endpoint = updateApiUrl
+            if (endpoint.isBlank()) {
+                Log.d(TAG, "Update channel disabled for this edition")
+                return@withContext null
+            }
+            val conn = URL(endpoint).openConnection() as HttpURLConnection
             conn.requestMethod = "GET"
             conn.setRequestProperty("Accept", "application/vnd.github+json")
             conn.connectTimeout = TIMEOUT_MS
@@ -73,10 +79,13 @@ object UpdateChecker {
      * Pre-release tags (beta, rc, alpha) are considered older than the
      * same version without a tag: 2.3-beta < 2.3
      */
-    private fun isNewer(remote: String, current: String): Boolean {
-        // Strip build-variant suffixes (e.g. "-lite") — they aren't version indicators
-        val cleanCurrent = current.removeSuffix("-lite")
-        val (rNums, rPre) = parseVersion(remote)
+    internal fun isNewer(remote: String, current: String): Boolean {
+        // Strip edition suffixes. They identify the APK flavor, not release maturity.
+        // Treating "-personal" as a prerelease made the same numeric upstream tag
+        // look newer than a Personal build.
+        val cleanCurrent = stripEditionSuffix(current)
+        val cleanRemote = stripEditionSuffix(remote)
+        val (rNums, rPre) = parseVersion(cleanRemote)
         val (cNums, cPre) = parseVersion(cleanCurrent)
         for (i in 0 until maxOf(rNums.size, cNums.size)) {
             val rv = rNums.getOrElse(i) { 0 }
@@ -90,6 +99,12 @@ object UpdateChecker {
         if (cPre == null && rPre != null) return false
         return false
     }
+
+    private fun stripEditionSuffix(version: String): String =
+        version
+            .removeSuffix("-personal")
+            .removeSuffix("-dns-lab")
+            .removeSuffix("-lite")
 
     /** Split "2.3.1-beta" into ([2,3,1], "beta"). */
     private fun parseVersion(version: String): Pair<List<Int>, String?> {

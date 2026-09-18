@@ -1,6 +1,7 @@
 package app.slipnet.data.repository
 
 import app.slipnet.data.local.database.ProfileDao
+import app.slipnet.data.local.datastore.PreferencesDataStore
 import app.slipnet.data.mapper.ProfileMapper
 import app.slipnet.domain.model.ServerProfile
 import app.slipnet.domain.repository.ProfileRepository
@@ -12,7 +13,8 @@ import javax.inject.Singleton
 @Singleton
 class ProfileRepositoryImpl @Inject constructor(
     private val profileDao: ProfileDao,
-    private val profileMapper: ProfileMapper
+    private val profileMapper: ProfileMapper,
+    private val preferencesDataStore: PreferencesDataStore,
 ) : ProfileRepository {
 
     override fun getAllProfiles(): Flow<List<ServerProfile>> {
@@ -43,6 +45,7 @@ class ProfileRepositoryImpl @Inject constructor(
 
     override suspend fun deleteProfile(id: Long) {
         profileDao.deleteProfile(id)
+        preferencesDataStore.resetManagedProfileUsage(id)
     }
 
     override suspend fun setActiveProfile(id: Long) {
@@ -56,6 +59,10 @@ class ProfileRepositoryImpl @Inject constructor(
 
     override suspend fun updateLastConnectedAt(id: Long) {
         profileDao.updateLastConnectedAt(id, System.currentTimeMillis())
+    }
+
+    override suspend fun updateVlessEchSeed(id: Long, encodedSeed: String, updatedAt: Long): Boolean {
+        return profileDao.updateVlessEchSeed(id, encodedSeed, updatedAt) == 1
     }
 
     override suspend fun updateProfileOrder(orderedIds: List<Long>) {

@@ -8,8 +8,10 @@ import app.slipnet.domain.model.ConnectionState
 import app.slipnet.domain.model.ProfileChain
 import app.slipnet.domain.model.ServerProfile
 import app.slipnet.domain.model.TrafficStats
+import app.slipnet.domain.model.TunnelType
 import app.slipnet.domain.repository.ChainRepository
 import app.slipnet.domain.repository.ProfileRepository
+import app.slipnet.tunnel.EchConfigResolver
 import app.slipnet.widget.VpnWidgetCompactProvider
 import app.slipnet.widget.VpnWidgetProvider
 import app.slipnet.util.DeviceIdUtil
@@ -101,6 +103,15 @@ class VpnConnectionManager @Inject constructor(
             putExtra(SlipNetVpnService.EXTRA_PROFILE_ID, profile.id)
         }
         ContextCompat.startForegroundService(context, intent)
+    }
+
+    fun prepareAuthoritySwitch(profile: ServerProfile) {
+        pendingProfile = profile
+        _connectionState.value = ConnectionState.Connecting
+        _dnsWarning.value = null
+        scope.launch {
+            profileRepository.setActiveProfile(profile.id)
+        }
     }
 
     fun reconnect(profile: ServerProfile) {
@@ -240,6 +251,27 @@ class VpnConnectionManager @Inject constructor(
 
     suspend fun getProfileById(id: Long): ServerProfile? {
         return profileRepository.getProfileById(id)
+    }
+
+    suspend fun getAllProfiles(): List<ServerProfile> {
+        return profileRepository.getAllProfiles().first()
+    }
+
+    suspend fun updateVlessEchSeed(id: Long, encodedSeed: String, updatedAt: Long): Boolean {
+        return profileRepository.updateVlessEchSeed(id, encodedSeed, updatedAt)
+    }
+
+    suspend fun persistAuthenticatedVlessEchSeed(
+        id: Long,
+        acceptedConfig: ByteArray,
+        updatedAt: Long = System.currentTimeMillis(),
+    ): Boolean {
+        if (id <= 0L) return false
+        val encoded = EchConfigResolver.encodeStoredSeed(acceptedConfig) ?: return false
+        val latest = profileRepository.getProfileById(id) ?: return false
+        if (latest.tunnelType != TunnelType.VLESS) return false
+        if (latest.vlessEchConfigSeed == encoded) return true
+        return profileRepository.updateVlessEchSeed(id, encoded, updatedAt)
     }
 
     suspend fun getActiveProfile(): ServerProfile? {

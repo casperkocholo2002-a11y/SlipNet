@@ -1,6 +1,7 @@
 package app.slipnet.tunnel
 
 import android.content.Context
+import android.os.Build
 import app.slipnet.util.AppLog as Log
 import java.io.BufferedReader
 import java.io.File
@@ -141,8 +142,12 @@ object NaiveBridge {
                 Log.d(TAG, "Stopping NaiveProxy process...")
                 p.destroy()
                 Thread.sleep(500)
-                if (p.isAlive) {
-                    p.destroyForcibly()
+                if (isProcessAlive(p)) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        p.destroyForcibly()
+                    } else {
+                        p.destroy()
+                    }
                 }
                 Log.d(TAG, "NaiveProxy process stopped")
             } catch (e: Exception) {
@@ -154,8 +159,16 @@ object NaiveBridge {
     }
 
     fun isRunning(): Boolean {
-        return process?.isAlive == true
+        return process?.let(::isProcessAlive) == true
     }
+
+    private fun isProcessAlive(candidate: Process): Boolean =
+        try {
+            candidate.exitValue()
+            false
+        } catch (_: IllegalThreadStateException) {
+            true
+        }
 
     fun isClientHealthy(): Boolean {
         return isRunning() && isReady

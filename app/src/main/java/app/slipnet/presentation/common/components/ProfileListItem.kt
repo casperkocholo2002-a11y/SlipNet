@@ -315,16 +315,18 @@ fun ProfileListItem(
             Row(
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                IconButton(
-                    onClick = onEditClick,
-                    modifier = Modifier.size(36.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Edit,
-                        contentDescription = "Edit",
-                        modifier = Modifier.size(18.dp),
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                if (!profile.isLocked) {
+                    IconButton(
+                        onClick = onEditClick,
+                        modifier = Modifier.size(36.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Edit,
+                            contentDescription = "Edit",
+                            modifier = Modifier.size(18.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
 
                 // More menu: pin + export options

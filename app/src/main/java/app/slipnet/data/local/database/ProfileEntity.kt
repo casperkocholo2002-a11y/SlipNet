@@ -223,6 +223,21 @@ data class ProfileEntity(
     @ColumnInfo(name = "vless_ws_path", defaultValue = "/")
     val vlessWsPath: String = "/",
 
+    @ColumnInfo(name = "vless_failure_provider_id", defaultValue = "")
+    val vlessFailureProviderId: String = "",
+
+    @ColumnInfo(name = "vless_failure_account_id", defaultValue = "")
+    val vlessFailureAccountId: String = "",
+
+    @ColumnInfo(name = "vless_failure_hostname", defaultValue = "")
+    val vlessFailureHostname: String = "",
+
+    @ColumnInfo(name = "vless_ech_config_seed", defaultValue = "")
+    val vlessEchConfigSeed: String = "",
+
+    @ColumnInfo(name = "vless_ech_config_updated_at", defaultValue = "0")
+    val vlessEchConfigUpdatedAt: Long = 0L,
+
     @ColumnInfo(name = "cdn_ip", defaultValue = "")
     val cdnIp: String = "",
 

@@ -198,7 +198,9 @@ fun NavGraph(
         ) { backStackEntry ->
             val profileId = backStackEntry.arguments?.getLong("profileId")?.takeIf { it != -1L }
             val fromProfile = backStackEntry.arguments?.getBoolean("fromProfile") ?: false
-            val parentEntry = remember { navController.getBackStackEntry(NavRoutes.DnsScanner.route) }
+            val parentEntry = remember(backStackEntry) {
+                navController.getBackStackEntry(NavRoutes.DnsScanner.route)
+            }
             ScanResultsScreen(
                 profileId = profileId,
                 fromProfile = fromProfile,

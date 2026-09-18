@@ -17,6 +17,14 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
+import app.slipnet.BuildConfig
+import app.slipnet.authority.PersonalVlessAuthorityFact
+import app.slipnet.authority.PersonalVlessAuthorityHooksProvider
+import app.slipnet.authority.PersonalVlessRouteDescriptor
+import app.slipnet.authority.PersonalVlessSwitchDecision
+import app.slipnet.authority.PersonalVlessSwitchGuard
+import app.slipnet.authority.PersonalVlessReconnectDisposition
+import app.slipnet.authority.PersonalVlessReconnectOrigin
 import app.slipnet.util.AppLog as Log
 import app.slipnet.data.local.datastore.PreferencesDataStore
 import app.slipnet.data.local.datastore.SplitTunnelingMode
@@ -41,6 +49,8 @@ import app.slipnet.tunnel.SlipstreamBridge
 import app.slipnet.tunnel.SlipstreamSocksBridge
 import app.slipnet.tunnel.Socks5ProxyBridge
 import app.slipnet.tunnel.VlessBridge
+import app.slipnet.tunnel.EchConfigResolver
+import app.slipnet.tunnel.EchMode
 import app.slipnet.tunnel.SnowflakeBridge
 import app.slipnet.tunnel.SshTunnelBridge
 import app.slipnet.tunnel.TorSocksBridge
@@ -76,6 +86,7 @@ class SlipNetVpnService : VpnService() {
         private const val DEFAULT_DNS = "8.8.8.8"
         private const val WAKELOCK_TIMEOUT_MS = 10 * 60 * 1000L  // 10 minutes (Chinese OEM ROMs kill indefinite WakeLocks)
         private const val WAKELOCK_RENEW_INTERVAL_MS = 9 * 60 * 1000L  // renew 1 min before expiry
+        private const val PERSONAL_VLESS_STARTUP_WAKELOCK_MS = 30_000L
         private const val HEALTH_CHECK_INTERVAL_MS = 15000L
         private const val QUIC_DOWN_THRESHOLD = 2 // Reconnect after 2 checks (~30s) with QUIC down
         private const val SSH_PROBE_INTERVAL = 2 // Probe SSH session every 2 health checks (~30s)
@@ -151,6 +162,12 @@ class SlipNetVpnService : VpnService() {
     private var isProxyOnly = false
     private var isUserInitiatedDisconnect = false
     private var currentProfileName = ""
+    @Volatile
+    private var personalVlessFailClosed = false
+    @Volatile
+    private var personalVlessAuthoritySwitchInProgress = false
+    private val personalVlessAttemptedProfileIds = linkedSetOf<Long>()
+    private val personalVlessProbeRetriedProfileIds = linkedSetOf<Long>()
     private var currentChainId: Long = -1
     /** Tunnel types active in the current chain (outermost first), for cleanup ordering. */
     private var activeChainLayers: List<TunnelType> = emptyList()
@@ -215,6 +232,209 @@ class SlipNetVpnService : VpnService() {
         prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     }
 
+    private fun isPersonalVlessAuthorityPath(): Boolean =
+        BuildConfig.PERSONAL_BUILD && currentTunnelType == TunnelType.VLESS
+
+    private fun personalVlessDescriptor(
+        profile: app.slipnet.domain.model.ServerProfile,
+    ): PersonalVlessRouteDescriptor =
+        PersonalVlessRouteDescriptor(
+            profileId = profile.id,
+            routeId = "profile:${profile.id}",
+            providerId = profile.vlessFailureProviderId,
+            accountId = profile.vlessFailureAccountId,
+            hostname = profile.vlessFailureHostname,
+            enabled = !profile.isExpired &&
+                (profile.boundDeviceId.isEmpty() || profile.boundDeviceId == connectionManager.getDeviceId()),
+        )
+
+    private suspend fun selectPersonalVlessAuthority(profileId: Long, tunnelType: TunnelType) {
+        personalVlessFailClosed = false
+        personalVlessAuthoritySwitchInProgress = false
+        if (BuildConfig.PERSONAL_BUILD && tunnelType == TunnelType.VLESS) {
+            val allProfiles = connectionManager.getAllProfiles()
+                .filter { it.tunnelType == TunnelType.VLESS }
+            val profileById = allProfiles.associateBy { it.id }
+            val allDescriptors = allProfiles.map(::personalVlessDescriptor)
+            val active = allDescriptors.firstOrNull { it.profileId == profileId }
+            if (active == null) {
+                PersonalVlessAuthorityHooksProvider.hooks.clearRoute()
+            } else {
+                val activeProfile = profileById[profileId]
+                val managedIdentity = activeProfile?.lockPasswordHash.orEmpty()
+                val participating = if (active.hasCompleteFailureDomain) {
+                    allDescriptors.filter { candidate ->
+                        val complete = candidate.profileId == active.profileId ||
+                            candidate.hasCompleteFailureDomain
+                        val sameManagedSubscription = if (activeProfile?.isLocked == true) {
+                            val candidateProfile = profileById[candidate.profileId]
+                            managedIdentity.isNotBlank() &&
+                                candidateProfile?.isLocked == true &&
+                                candidateProfile.lockPasswordHash == managedIdentity
+                        } else {
+                            true
+                        }
+                        complete && sameManagedSubscription
+                    }
+                } else {
+                    listOf(active)
+                }
+                PersonalVlessAuthorityHooksProvider.hooks.selectRoute(active, participating)
+            }
+        } else {
+            PersonalVlessAuthorityHooksProvider.hooks.clearRoute()
+        }
+    }
+
+    private fun observePersonalVless(
+        fact: PersonalVlessAuthorityFact,
+        detail: String? = null,
+    ) {
+        if (!isPersonalVlessAuthorityPath()) return
+        PersonalVlessAuthorityHooksProvider.hooks.observe(
+            fact = fact,
+            detail = detail,
+            timestampEpochMs = System.currentTimeMillis(),
+        )
+        if (fact == PersonalVlessAuthorityFact.TERMINAL_SUCCESS && currentProfileId != -1L) {
+            personalVlessProbeRetriedProfileIds.remove(currentProfileId)
+        }
+    }
+
+    private suspend fun failClosedPersonalVless(
+        reason: String,
+        fact: PersonalVlessAuthorityFact = PersonalVlessAuthorityFact.TRANSPORT_FAILURE,
+    ): Boolean {
+        if (!isPersonalVlessAuthorityPath()) return false
+        val disposition = PersonalVlessAuthorityHooksProvider.hooks.reconnectDisposition(
+            PersonalVlessReconnectOrigin.AUTONOMOUS
+        )
+        if (disposition != PersonalVlessReconnectDisposition.BLOCK_FAIL_CLOSED) return false
+        if (personalVlessFailClosed || personalVlessAuthoritySwitchInProgress) return true
+
+        observePersonalVless(fact, reason)
+
+        val expectedTarget =
+            PersonalVlessAuthorityHooksProvider.hooks.qualifiedSwitchTargetDescriptorOrNull()
+        val targetProfile = expectedTarget?.let { connectionManager.getProfileById(it.profileId) }
+        val latestTarget = targetProfile
+            ?.takeIf { it.tunnelType == TunnelType.VLESS }
+            ?.let(::personalVlessDescriptor)
+        val decision = PersonalVlessSwitchGuard.decide(
+            activeProfileId = currentProfileId,
+            expectedTarget = expectedTarget,
+            latestTarget = latestTarget,
+            attemptedProfileIds = personalVlessAttemptedProfileIds,
+        )
+
+        val authoritySnapshot = PersonalVlessAuthorityHooksProvider.hooks.snapshot()
+        if (
+            decision == PersonalVlessSwitchDecision.NO_TARGET &&
+            authoritySnapshot?.authorityAction == "PROBE_CURRENT" &&
+            currentProfileId != -1L &&
+            currentProfileId !in personalVlessProbeRetriedProfileIds
+        ) {
+            val sourceProfileId = currentProfileId
+            val sourceProfile = connectionManager.getProfileById(sourceProfileId)
+            if (sourceProfile != null && sourceProfile.tunnelType == TunnelType.VLESS) {
+                personalVlessProbeRetriedProfileIds += sourceProfileId
+                personalVlessAuthoritySwitchInProgress = true
+                healthCheckJob?.cancel()
+                reconnectDebounceJob?.cancel()
+                networkLostJob?.cancel()
+                autoReconnectJob?.cancel()
+                bootRetryJob?.cancel()
+                isReconnecting = false
+                isAutoReconnecting = false
+                isKillSwitchActive = false
+                vpnRepository.setAutoReconnect(false)
+                app.slipnet.util.AppLog.operational("AUTHORITY_PROBE_CURRENT")
+                Log.i(
+                    TAG,
+                    "Personal VLESS authority probing current profile $sourceProfileId once: $reason",
+                )
+                connectionManager.prepareAuthoritySwitch(sourceProfile)
+                withContext(kotlinx.coroutines.NonCancellable) {
+                    cleanupConnection(preservePersonalVlessAuthority = true)
+                }
+                serviceScope.launch {
+                    connect(
+                        sourceProfile.id,
+                        authoritySwitch = true,
+                        preservePersonalAuthority = true,
+                    )
+                }
+                return true
+            }
+        }
+
+        if (decision == PersonalVlessSwitchDecision.ADMIT && targetProfile != null) {
+            val sourceProfileId = currentProfileId
+            personalVlessAttemptedProfileIds += sourceProfileId
+            personalVlessAuthoritySwitchInProgress = true
+            healthCheckJob?.cancel()
+            reconnectDebounceJob?.cancel()
+            networkLostJob?.cancel()
+            autoReconnectJob?.cancel()
+            bootRetryJob?.cancel()
+            isReconnecting = false
+            isAutoReconnecting = false
+            isKillSwitchActive = false
+            vpnRepository.setAutoReconnect(false)
+            app.slipnet.util.AppLog.operational("AUTHORITY_SWITCH_ADMITTED")
+            Log.i(
+                TAG,
+                "Personal VLESS authority switching profile $sourceProfileId -> ${targetProfile.id}: $reason",
+            )
+            connectionManager.prepareAuthoritySwitch(targetProfile)
+            withContext(kotlinx.coroutines.NonCancellable) {
+                cleanupConnection()
+            }
+            serviceScope.launch {
+                connect(targetProfile.id, authoritySwitch = true)
+            }
+            return true
+        }
+
+        personalVlessFailClosed = true
+        app.slipnet.util.AppLog.operational("AUTHORITY_FAIL_CLOSED")
+        Log.w(TAG, "Personal VLESS authority fail-closed ($decision): $reason")
+        healthCheckJob?.cancel()
+        reconnectDebounceJob?.cancel()
+        networkLostJob?.cancel()
+        autoReconnectJob?.cancel()
+        bootRetryJob?.cancel()
+        isReconnecting = false
+        isAutoReconnecting = false
+        isKillSwitchActive = false
+        vpnRepository.setAutoReconnect(false)
+        connectionManager.onVpnError("VPN connection lost - $reason")
+        withContext(kotlinx.coroutines.NonCancellable) {
+            cleanupConnection()
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
+        return true
+    }
+
+    private fun reconnectPersonalVlessFromUser(): Boolean {
+        if (!isPersonalVlessAuthorityPath()) return false
+        val disposition = PersonalVlessAuthorityHooksProvider.hooks.reconnectDisposition(
+            PersonalVlessReconnectOrigin.USER_EXPLICIT
+        )
+        if (disposition != PersonalVlessReconnectDisposition.ALLOW_USER_SAME_PROFILE) return true
+        val profileId = currentProfileId
+        if (profileId == -1L) return true
+        personalVlessAttemptedProfileIds.clear()
+        personalVlessProbeRetriedProfileIds.clear()
+        personalVlessAuthoritySwitchInProgress = false
+        serviceScope.launch {
+            cleanupConnection()
+            connect(profileId)
+        }
+        return true
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_CONNECT -> {
@@ -228,6 +448,9 @@ class SlipNetVpnService : VpnService() {
                 if (chainId != -1L) {
                     connectChain(chainId)
                 } else if (profileId != -1L) {
+                    personalVlessAttemptedProfileIds.clear()
+                    personalVlessProbeRetriedProfileIds.clear()
+                    personalVlessAuthoritySwitchInProgress = false
                     connect(profileId)
                 }
             }
@@ -241,7 +464,9 @@ class SlipNetVpnService : VpnService() {
                     isProxyOnly = isProxyOnly
                 )
                 startForeground(NotificationHelper.VPN_NOTIFICATION_ID, notification)
-                handleNetworkChange("manual reconnect")
+                if (!reconnectPersonalVlessFromUser()) {
+                    handleNetworkChange("manual reconnect")
+                }
             }
             null -> {
                 // Service was restarted by the system after being killed
@@ -264,6 +489,13 @@ class SlipNetVpnService : VpnService() {
         Log.i(TAG, "Service restarted by system (flags=$flags, wasConnected=$wasConnected, lastProfileId=$lastProfileId)")
 
         if (wasConnected && lastProfileId != -1L) {
+            if (BuildConfig.PERSONAL_BUILD) {
+                Log.i(TAG, "Personal VLESS authority blocks autonomous service-restart reconnect")
+                PersonalVlessAuthorityHooksProvider.hooks.clearRoute()
+                clearConnectionState()
+                stopSelf()
+                return
+            }
             Log.i(TAG, "Attempting to auto-reconnect with profile $lastProfileId")
             connect(lastProfileId)
         } else {
@@ -294,7 +526,14 @@ class SlipNetVpnService : VpnService() {
         Log.d(TAG, "Cleared connection state")
     }
 
-    private fun connect(profileId: Long) {
+    private fun connect(
+        profileId: Long,
+        authoritySwitch: Boolean = false,
+        preservePersonalAuthority: Boolean = false,
+    ) {
+        if (authoritySwitch) {
+            Log.i(TAG, "Executing qualified Personal VLESS authority switch to profile $profileId")
+        }
         // Cancel stale state observer from a previous connection to prevent it
         // from calling stopSelf() while the new connection is starting.
         stateObserverJob?.cancel()
@@ -369,7 +608,7 @@ class SlipNetVpnService : VpnService() {
             }
 
             // Redact sensitive config from in-app debug log for locked profiles
-            app.slipnet.util.AppLog.redactSensitive = profile.isLocked
+            app.slipnet.util.AppLog.redactSensitive = BuildConfig.PERSONAL_BUILD || profile.isLocked
 
             // Dismiss any previous reconnect/disconnect notifications
             getSystemService(NotificationManager::class.java).apply {
@@ -383,20 +622,33 @@ class SlipNetVpnService : VpnService() {
 
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
 
-            // Acquire WakeLock with timeout (Chinese OEM ROMs kill indefinite WakeLocks)
+            val efficientPersonalVlessPower =
+                BuildConfig.PERSONAL_BUILD && profile.tunnelType == TunnelType.VLESS
+
+            // Personal VLESS only needs a short startup guard. Keeping a partial WakeLock
+            // for the entire VPN session blocks deep sleep and materially increases heat.
             if (wakeLock == null) {
                 wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SlipNet:VpnWakeLock").apply {
                     setReferenceCounted(false)
-                    acquire(WAKELOCK_TIMEOUT_MS)
+                    acquire(if (efficientPersonalVlessPower) PERSONAL_VLESS_STARTUP_WAKELOCK_MS else WAKELOCK_TIMEOUT_MS)
                 }
-                Log.d(TAG, "WakeLock acquired (${WAKELOCK_TIMEOUT_MS / 60000}min timeout)")
+                Log.d(TAG, "WakeLock acquired")
             }
-            startWakeLockRenewal()
+            if (efficientPersonalVlessPower) {
+                wakeLockRenewJob?.cancel()
+                wakeLockRenewJob = null
+            } else {
+                startWakeLockRenewal()
+            }
 
-            // Acquire WifiLock to keep Wi-Fi radio active when screen is off.
-            // Chinese OEMs (Xiaomi, Huawei, etc.) kill apps using WIFI_MODE_FULL_LOW_LATENCY,
-            // so fall back to WIFI_MODE_FULL on those devices.
-            if (wifiLock == null) {
+            // A permanent FULL_LOW_LATENCY WifiLock keeps Wi-Fi power-save disabled.
+            // Skip it for Personal VLESS; the foreground VPN + active sockets are sufficient,
+            // while transport privacy/ECH behavior is completely independent of this lock.
+            if (efficientPersonalVlessPower) {
+                wifiLock?.let { if (it.isHeld) it.release() }
+                wifiLock = null
+                app.slipnet.util.AppLog.operational("POWER_POLICY_EFFICIENT_VLESS")
+            } else if (wifiLock == null) {
                 val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
                 @Suppress("DEPRECATION")
                 val wifiMode = when {
@@ -488,6 +740,13 @@ class SlipNetVpnService : VpnService() {
 
                 // Track the tunnel type for this connection
                 currentTunnelType = profile.tunnelType
+                if (preservePersonalAuthority) {
+                    personalVlessFailClosed = false
+                    personalVlessAuthoritySwitchInProgress = false
+                    Log.i(TAG, "Preserving Personal VLESS authority evidence for same-route probe retry")
+                } else {
+                    selectPersonalVlessAuthority(profile.id, currentTunnelType)
+                }
                 Log.i(TAG, "Starting VPN with tunnel type: $currentTunnelType")
 
                 // Global resolver override: replace profile resolvers with user's global list
@@ -555,6 +814,14 @@ class SlipNetVpnService : VpnService() {
                 throw e
             } catch (e: Exception) {
                 Log.e(TAG, "Exception during connection", e)
+
+                if (isPersonalVlessAuthorityPath()) {
+                    failClosedPersonalVless(
+                        reason = "connect exception: ${e.message ?: "unknown"}",
+                        fact = PersonalVlessAuthorityFact.TRANSPORT_FAILURE,
+                    )
+                    return@launch
+                }
 
                 // Boot-triggered retry: network may not be ready yet after device boot.
                 // Retry with exponential backoff regardless of connectionWasSuccessful.
@@ -636,7 +903,7 @@ class SlipNetVpnService : VpnService() {
                     }
                 }
             }
-            app.slipnet.util.AppLog.redactSensitive = profiles.any { it.isLocked }
+            app.slipnet.util.AppLog.redactSensitive = BuildConfig.PERSONAL_BUILD || profiles.any { it.isLocked }
 
             getSystemService(android.app.NotificationManager::class.java).apply {
                 cancel(NotificationHelper.RECONNECT_NOTIFICATION_ID)
@@ -3036,10 +3303,72 @@ class SlipNetVpnService : VpnService() {
      *   -> SniFragmentForwarder (proxyPort+1) -> CDN IP:443
      *     -> TLS (fragmented ClientHello) -> WebSocket -> VLESS -> CDN -> Server
      */
+    private data class PersonalEchSetup(
+        val mode: EchMode,
+        val configList: ByteArray?,
+    )
+
+    private suspend fun resolvePersonalEch(profile: app.slipnet.domain.model.ServerProfile): PersonalEchSetup {
+        if (
+            !BuildConfig.PERSONAL_BUILD ||
+            profile.sniFragmentEnabled ||
+            profile.vlessSecurity.equals("none", ignoreCase = true)
+        ) {
+            return PersonalEchSetup(EchMode.DISABLED, null)
+        }
+        val config = EchConfigResolver.decodeStoredSeed(profile.vlessEchConfigSeed)
+        if (config == null || config.isEmpty()) {
+            throw IllegalStateException("ECH_REQUIRED stored config unavailable")
+        }
+        return PersonalEchSetup(EchMode.REQUIRED, config)
+    }
+
+    private fun authenticatedEchSeedPersistence(profileId: Long): ((ByteArray) -> Unit)? {
+        if (!BuildConfig.PERSONAL_BUILD || profileId <= 0L) return null
+        return { acceptedConfig ->
+            val configCopy = acceptedConfig.copyOf()
+            serviceScope.launch(Dispatchers.IO) {
+                try {
+                    val updated = connectionManager.persistAuthenticatedVlessEchSeed(profileId, configCopy)
+                    if (updated) {
+                        app.slipnet.util.AppLog.operational("ECH_SEED_RENEWAL_PERSISTED")
+                        Log.i(TAG, "Authenticated ECH retry seed persisted for current profile")
+                    } else {
+                        app.slipnet.util.AppLog.operational("ECH_SEED_RENEWAL_SKIPPED")
+                        Log.w(TAG, "Authenticated ECH retry seed was not persisted")
+                    }
+                } catch (_: Throwable) {
+                    app.slipnet.util.AppLog.operational("ECH_SEED_RENEWAL_FAILED")
+                    Log.w(TAG, "Authenticated ECH retry seed persistence failed; live tunnel remains unchanged")
+                }
+            }
+        }
+    }
+
     private suspend fun connectVless(profile: app.slipnet.domain.model.ServerProfile, dnsServer: String) {
         val proxyPort = preferencesDataStore.proxyListenPort.first()
         val proxyHost = preferencesDataStore.proxyListenAddress.first()
         vpnRepository.setCurrentTunnelType(app.slipnet.domain.model.TunnelType.VLESS)
+
+        val echSetup = try {
+            resolvePersonalEch(profile)
+        } catch (error: Exception) {
+            val reason = error.message ?: "ECH_REQUIRED setup failed"
+            if (failClosedPersonalVless(reason, PersonalVlessAuthorityFact.TRANSPORT_FAILURE)) return
+            connectionManager.onVpnError(reason)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
+
+        app.slipnet.util.AppLog.operational(
+            "VLESS_FEATURES",
+            "ech_required" to if (echSetup.mode == EchMode.REQUIRED) 1L else 0L,
+            "fragment" to if (profile.sniFragmentEnabled) 1L else 0L,
+            "micro_legacy" to if (!BuildConfig.PERSONAL_BUILD && profile.chPaddingEnabled) 1L else 0L,
+            "header_obfs" to if (profile.wsHeaderObfuscation) 1L else 0L,
+            "cover" to if (profile.wsPaddingEnabled) 1L else 0L,
+        )
 
         if (isProxyOnly) {
             VlessBridge.debugLogging = preferencesDataStore.debugLogging.first()
@@ -3061,20 +3390,27 @@ class SlipNetVpnService : VpnService() {
                     fakeDecoyHost = profile.fakeDecoyHost,
                     tcpMaxSeg = profile.tcpMaxSeg,
                     vlessSni = profile.vlessSni,
-                    chPaddingEnabled = profile.chPaddingEnabled,
+                    chPaddingEnabled = if (BuildConfig.PERSONAL_BUILD) false else profile.chPaddingEnabled,
                     wsHeaderObfuscation = profile.wsHeaderObfuscation,
-                    wsPaddingEnabled = profile.wsPaddingEnabled
+                    wsPaddingEnabled = profile.wsPaddingEnabled,
+                    echMode = echSetup.mode,
+                    echConfigList = echSetup.configList,
+                    onAuthenticatedEchConfigAccepted = authenticatedEchSeedPersistence(profile.id),
                 )
             }
             if (bridgeResult.isFailure) {
-                connectionManager.onVpnError(bridgeResult.exceptionOrNull()?.message ?: "Failed to start VLESS bridge")
+                val reason = bridgeResult.exceptionOrNull()?.message ?: "Failed to start VLESS bridge"
+                if (failClosedPersonalVless(reason, PersonalVlessAuthorityFact.TRANSPORT_FAILURE)) return
+                connectionManager.onVpnError(reason)
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
                 return
             }
 
             if (!waitForProxyReady(proxyPort, maxAttempts = 30, delayMs = 100)) {
-                connectionManager.onVpnError("VLESS bridge failed to start")
+                val reason = "VLESS bridge failed to start"
+                if (failClosedPersonalVless(reason, PersonalVlessAuthorityFact.TRANSPORT_FAILURE)) return
+                connectionManager.onVpnError(reason)
                 VlessBridge.stop()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
@@ -3084,6 +3420,7 @@ class SlipNetVpnService : VpnService() {
             val probeResult = withContext(Dispatchers.IO) { VlessBridge.probe() }
             if (probeResult.isFailure) {
                 val reason = probeResult.exceptionOrNull()?.message ?: "unknown"
+                if (failClosedPersonalVless(reason, PersonalVlessAuthorityFact.STRUCTURAL_FAILURE)) return
                 connectionManager.onVpnError("VLESS setup check failed: $reason. Verify CDN IP, domain, and WS path.")
                 VlessBridge.stop()
                 stopForeground(STOP_FOREGROUND_REMOVE)
@@ -3091,7 +3428,24 @@ class SlipNetVpnService : VpnService() {
                 return
             }
 
+            if (BuildConfig.PERSONAL_BUILD) {
+                val authProbe = withContext(Dispatchers.IO) { VlessBridge.probeAuthenticated() }
+                if (authProbe.isFailure) {
+                    val reason = authProbe.exceptionOrNull()?.message ?: "VLESS authentication failed"
+                    if (failClosedPersonalVless(reason, PersonalVlessAuthorityFact.STRUCTURAL_FAILURE)) return
+                    connectionManager.onVpnError("VLESS authentication failed: $reason")
+                    VlessBridge.stop()
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                    return
+                }
+            }
+
+            observePersonalVless(PersonalVlessAuthorityFact.STRUCTURAL_SUCCESS, "websocket + VLESS auth")
             vpnRepository.setProxyConnected(profile)
+            observePersonalVless(PersonalVlessAuthorityFact.TERMINAL_SUCCESS, "personal VLESS proxy connected")
+            app.slipnet.util.AppLog.operational("VPN_INDICATOR_CONNECTED", "proxy_only" to 1L)
+            releasePersonalVlessSteadyStateLocks()
             Log.i(TAG, "Proxy-only mode: VLESS bridge ready on $proxyHost:$proxyPort")
             finishConnection()
             return
@@ -3100,7 +3454,9 @@ class SlipNetVpnService : VpnService() {
         // Step 1: Establish VPN interface
         vpnInterface = establishVpnInterface(dnsServer)
         if (vpnInterface == null) {
-            connectionManager.onVpnError("Failed to establish VPN interface")
+            val reason = "Failed to establish VPN interface"
+            if (failClosedPersonalVless(reason, PersonalVlessAuthorityFact.TRANSPORT_FAILURE)) return
+            connectionManager.onVpnError(reason)
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return
@@ -3127,13 +3483,18 @@ class SlipNetVpnService : VpnService() {
                 fakeDecoyHost = profile.fakeDecoyHost,
                 tcpMaxSeg = profile.tcpMaxSeg,
                 vlessSni = profile.vlessSni,
-                chPaddingEnabled = profile.chPaddingEnabled,
+                chPaddingEnabled = if (BuildConfig.PERSONAL_BUILD) false else profile.chPaddingEnabled,
                 wsHeaderObfuscation = profile.wsHeaderObfuscation,
-                wsPaddingEnabled = profile.wsPaddingEnabled
+                wsPaddingEnabled = profile.wsPaddingEnabled,
+                echMode = echSetup.mode,
+                echConfigList = echSetup.configList,
+                onAuthenticatedEchConfigAccepted = authenticatedEchSeedPersistence(profile.id),
             )
         }
         if (bridgeResult.isFailure) {
-            connectionManager.onVpnError(bridgeResult.exceptionOrNull()?.message ?: "Failed to start VLESS bridge")
+            val reason = bridgeResult.exceptionOrNull()?.message ?: "Failed to start VLESS bridge"
+            if (failClosedPersonalVless(reason, PersonalVlessAuthorityFact.TRANSPORT_FAILURE)) return
+            connectionManager.onVpnError(reason)
             vpnInterface?.close()
             vpnInterface = null
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -3142,7 +3503,9 @@ class SlipNetVpnService : VpnService() {
         }
 
         if (!waitForProxyReady(proxyPort, maxAttempts = 30, delayMs = 100)) {
-            connectionManager.onVpnError("VLESS bridge failed to start")
+            val reason = "VLESS bridge failed to start"
+            if (failClosedPersonalVless(reason, PersonalVlessAuthorityFact.TRANSPORT_FAILURE)) return
+            connectionManager.onVpnError(reason)
             VlessBridge.stop()
             vpnInterface?.close()
             vpnInterface = null
@@ -3154,6 +3517,7 @@ class SlipNetVpnService : VpnService() {
         val probeResult = withContext(Dispatchers.IO) { VlessBridge.probe() }
         if (probeResult.isFailure) {
             val reason = probeResult.exceptionOrNull()?.message ?: "unknown"
+            if (failClosedPersonalVless(reason, PersonalVlessAuthorityFact.STRUCTURAL_FAILURE)) return
             connectionManager.onVpnError("VLESS setup check failed: $reason. Verify CDN IP, domain, and WS path.")
             VlessBridge.stop()
             vpnInterface?.close()
@@ -3163,10 +3527,29 @@ class SlipNetVpnService : VpnService() {
             return
         }
 
+        if (BuildConfig.PERSONAL_BUILD) {
+            val authProbe = withContext(Dispatchers.IO) { VlessBridge.probeAuthenticated() }
+            if (authProbe.isFailure) {
+                val reason = authProbe.exceptionOrNull()?.message ?: "VLESS authentication failed"
+                if (failClosedPersonalVless(reason, PersonalVlessAuthorityFact.STRUCTURAL_FAILURE)) return
+                connectionManager.onVpnError("VLESS authentication failed: $reason")
+                VlessBridge.stop()
+                vpnInterface?.close()
+                vpnInterface = null
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+                return
+            }
+        }
+
+        observePersonalVless(PersonalVlessAuthorityFact.STRUCTURAL_SUCCESS, "websocket + VLESS auth")
+
         // Step 3: Start tun2socks
         val tun2socksResult = vpnRepository.startTun2Socks(profile, vpnInterface!!)
         if (tun2socksResult.isFailure) {
-            connectionManager.onVpnError(tun2socksResult.exceptionOrNull()?.message ?: "Failed to start tunnel")
+            val reason = tun2socksResult.exceptionOrNull()?.message ?: "Failed to start tunnel"
+            observePersonalVless(PersonalVlessAuthorityFact.TRANSPORT_FAILURE, reason)
+            connectionManager.onVpnError(reason)
             VlessBridge.stop()
             vpnInterface?.close()
             vpnInterface = null
@@ -3175,6 +3558,9 @@ class SlipNetVpnService : VpnService() {
             return
         }
 
+        observePersonalVless(PersonalVlessAuthorityFact.TERMINAL_SUCCESS, "personal VLESS tunnel connected")
+        app.slipnet.util.AppLog.operational("VPN_INDICATOR_CONNECTED", "proxy_only" to 0L)
+        releasePersonalVlessSteadyStateLocks()
         Log.d(TAG, "VLESS tunnel started")
         finishConnection()
     }
@@ -3846,8 +4232,15 @@ class SlipNetVpnService : VpnService() {
                     // Unconditional reconnect kills working DNSTT/SSH connections
                     // and causes unnecessary downtime on every Doze cycle.
                     if (!isCurrentProxyHealthy()) {
-                        Log.i(TAG, "Proxy unhealthy after Doze — reconnecting")
-                        debouncedReconnect("doze mode exit")
+                        if (isPersonalVlessAuthorityPath()) {
+                            Log.i(TAG, "Personal VLESS unhealthy after Doze — fail closed")
+                            serviceScope.launch {
+                                handleTunnelFailure("doze exit unhealthy")
+                            }
+                        } else {
+                            Log.i(TAG, "Proxy unhealthy after Doze — reconnecting")
+                            debouncedReconnect("doze mode exit")
+                        }
                     } else {
                         Log.d(TAG, "Proxy healthy after Doze — no reconnect needed")
                     }
@@ -3936,6 +4329,9 @@ class SlipNetVpnService : VpnService() {
                     networkLostJob = serviceScope.launch {
                         delay(3000)
                         Log.w(TAG, "No network available after loss of $network — reporting tunnel failure")
+                        if (isPersonalVlessAuthorityPath()) {
+                            observePersonalVless(PersonalVlessAuthorityFact.NETWORK_CHANGED, "network lost")
+                        }
                         handleTunnelFailure("network lost")
                     }
                 }
@@ -4025,6 +4421,10 @@ class SlipNetVpnService : VpnService() {
      * Waits 2s before triggering reconnection in case more changes come in.
      */
     private fun debouncedReconnect(reason: String) {
+        if (isPersonalVlessAuthorityPath()) {
+            observePersonalVless(PersonalVlessAuthorityFact.NETWORK_CHANGED, reason)
+            return
+        }
         // A reconnect supersedes any pending "network lost" disconnect
         networkLostJob?.cancel()
         networkLostJob = null
@@ -4043,6 +4443,10 @@ class SlipNetVpnService : VpnService() {
      * connections until the new proxy is ready.
      */
     private fun handleNetworkChange(reason: String = "unknown") {
+        if (isPersonalVlessAuthorityPath()) {
+            observePersonalVless(PersonalVlessAuthorityFact.NETWORK_CHANGED, reason)
+            return
+        }
         serviceScope.launch {
             // Ignore spurious network changes fired shortly after connection.
             // Chinese OEM ROMs (MIUI/HyperOS, EMUI) trigger network callbacks
@@ -5028,6 +5432,10 @@ class SlipNetVpnService : VpnService() {
                     }
                     is ConnectionState.Error -> {
                         stopTrafficNotificationPolling()
+                        if (isPersonalVlessAuthorityPath() && !isUserInitiatedDisconnect) {
+                            handleTunnelFailure("connection error: ${state.message}")
+                            return@collect
+                        }
                         // Don't stop service during kill switch — we're blocking traffic and reconnecting
                         if (isKillSwitchActive) return@collect
                         // Already handling reconnection — don't interfere
@@ -5073,12 +5481,17 @@ class SlipNetVpnService : VpnService() {
             var zeroThroughputSeconds = 0L
             var tunnelHealthWarningShown = false
             while (isActive) {
-                // Adaptive interval: 1s when active, 5s when idle, 10s when screen off.
+                // Personal VLESS prioritizes transport work over cosmetic stats polling.
+                // A 1s notification loop caused frequent IPC/wakeups and measurable heat.
                 val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
                 val screenOn = pm.isInteractive
+                val efficientPersonalVless = isPersonalVlessAuthorityPath()
                 val interval = when {
+                    !screenOn && efficientPersonalVless -> 30_000L
+                    efficientPersonalVless && idleCount >= 2 -> 15_000L
+                    efficientPersonalVless -> 5_000L
                     !screenOn -> 10_000L
-                    idleCount >= 3 -> 5_000L // 3+ consecutive idle ticks → slow down
+                    idleCount >= 3 -> 5_000L
                     else -> 1_000L
                 }
                 delay(interval)
@@ -5165,9 +5578,26 @@ class SlipNetVpnService : VpnService() {
     private fun stopTrafficNotificationPolling() {
         trafficNotificationJob?.cancel()
         trafficNotificationJob = null
+        // Capture the final bridge delta before terminal teardown resets local
+        // counters. Managed EA profiles persist this into their subscription total.
+        try {
+            vpnRepository.refreshTrafficStats()
+        } catch (e: Exception) {
+            Log.w(TAG, "Final traffic snapshot failed: ${e.javaClass.simpleName}")
+        }
         vpnRepository.resetSpeedTracking()
         lastNotifTotalBytes = -1L
         lastNotifHadSpeed = false
+    }
+
+    private fun resetTunnelTrafficStats() {
+        SlipstreamSocksBridge.resetTrafficStats()
+        DnsttSocksBridge.resetTrafficStats()
+        SshTunnelBridge.resetTrafficStats()
+        Socks5ProxyBridge.resetTrafficStats()
+        VlessBridge.resetTrafficStats()
+        NaiveSocksBridge.resetTrafficStats()
+        DohBridge.resetTrafficStats()
     }
 
     private fun disconnect() {
@@ -5218,11 +5648,10 @@ class SlipNetVpnService : VpnService() {
         stateObserverJob?.cancel()
         stateObserverJob = null
 
-        // Reset accumulated traffic stats so next connection starts fresh
-        SlipstreamSocksBridge.resetTrafficStats()
-        DnsttSocksBridge.resetTrafficStats()
-        SshTunnelBridge.resetTrafficStats()
-        Socks5ProxyBridge.resetTrafficStats()
+        // Reset accumulated traffic stats so next connection starts fresh.
+        // Keep this at the terminal session boundary, not inside bridge start(),
+        // so seamless reconnects do not erase the active session totals.
+        resetTunnelTrafficStats()
 
         disconnectJob = serviceScope.launch {
             Log.i(TAG, "Disconnecting VPN")
@@ -5249,6 +5678,16 @@ class SlipNetVpnService : VpnService() {
      * (MAX_SEAMLESS_RECONNECTS attempts), escalates to kill switch or auto-reconnect.
      */
     private suspend fun handleTunnelFailure(reason: String) {
+        val personalFact = if (
+            reason.contains("stall", ignoreCase = true) ||
+            reason.contains("not responding", ignoreCase = true)
+        ) {
+            PersonalVlessAuthorityFact.TRANSPORT_STALL
+        } else {
+            PersonalVlessAuthorityFact.TRANSPORT_FAILURE
+        }
+        if (failClosedPersonalVless(reason, personalFact)) return
+
         // Try seamless proxy restart first if tun2socks is still alive.
         // Skip if: tun2socks is dead, already in kill-switch/auto-reconnect,
         // or we've exhausted seamless attempts (prevents infinite loop).
@@ -5479,6 +5918,17 @@ class SlipNetVpnService : VpnService() {
         bootNetworkCallback = null
     }
 
+    private fun releasePersonalVlessSteadyStateLocks() {
+        if (!isPersonalVlessAuthorityPath()) return
+        wakeLockRenewJob?.cancel()
+        wakeLockRenewJob = null
+        wakeLock?.let { if (it.isHeld) it.release() }
+        wakeLock = null
+        wifiLock?.let { if (it.isHeld) it.release() }
+        wifiLock = null
+        app.slipnet.util.AppLog.operational("POWER_LOCKS_RELEASED")
+    }
+
     /** Release WakeLock and WifiLock if held. */
     private fun releaseLocks() {
         wakeLockRenewJob?.cancel()
@@ -5528,8 +5978,10 @@ class SlipNetVpnService : VpnService() {
      * Clean up all resources - must be called before stopping service.
      * This is a suspend function to run blocking operations on IO dispatcher.
      */
-    private suspend fun cleanupConnection() {
-        app.slipnet.util.AppLog.redactSensitive = false
+    private suspend fun cleanupConnection(
+        preservePersonalVlessAuthority: Boolean = false,
+    ) {
+        app.slipnet.util.AppLog.redactSensitive = BuildConfig.PERSONAL_BUILD
         Log.d(TAG, "Cleaning up connection resources")
 
         releaseLocks()
@@ -5588,6 +6040,9 @@ class SlipNetVpnService : VpnService() {
         }
         vpnInterface = null
 
+        if (!preservePersonalVlessAuthority) {
+            PersonalVlessAuthorityHooksProvider.hooks.clearRoute()
+        }
         currentProfileId = -1
     }
 
@@ -5615,6 +6070,8 @@ class SlipNetVpnService : VpnService() {
         isReconnecting = false
         stateObserverJob?.cancel()
         stateObserverJob = null
+        stopTrafficNotificationPolling()
+        resetTunnelTrafficStats()
         disconnectJob = serviceScope.launch {
             Log.i(TAG, "Disconnecting VPN (revoked)")
             clearConnectionState()
@@ -5629,8 +6086,13 @@ class SlipNetVpnService : VpnService() {
         super.onTaskRemoved(rootIntent)
         Log.i(TAG, "Task removed (app swiped from recents)")
 
-        // If VPN is active, save state and re-deliver start intent to keep running
+        // If VPN is active, save state and re-deliver start intent to keep running.
+        // Personal VLESS must not synthesize a reconnect command from task removal.
         if (currentProfileId != -1L) {
+            if (isPersonalVlessAuthorityPath()) {
+                Log.i(TAG, "Personal VLESS authority blocks task-removed reconnect redelivery")
+                return
+            }
             saveConnectionState(currentProfileId, true)
             val restartIntent = Intent(this, SlipNetVpnService::class.java).apply {
                 action = ACTION_CONNECT
@@ -5684,7 +6146,7 @@ class SlipNetVpnService : VpnService() {
      * Used in onDestroy where we can't suspend.
      */
     private fun cleanupConnectionSync() {
-        app.slipnet.util.AppLog.redactSensitive = false
+        app.slipnet.util.AppLog.redactSensitive = BuildConfig.PERSONAL_BUILD
         Log.d(TAG, "Quick cleanup (sync)")
 
         releaseLocks()
@@ -5750,6 +6212,7 @@ class SlipNetVpnService : VpnService() {
         }
         vpnInterface = null
 
+        PersonalVlessAuthorityHooksProvider.hooks.clearRoute()
         currentProfileId = -1
     }
 }

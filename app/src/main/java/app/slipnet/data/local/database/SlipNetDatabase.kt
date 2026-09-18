@@ -7,7 +7,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 
 @Database(
     entities = [ProfileEntity::class, ChainEntity::class],
-    version = 42,
+    version = 44,
     exportSchema = true
 )
 abstract class SlipNetDatabase : RoomDatabase() {
@@ -626,6 +626,22 @@ abstract class SlipNetDatabase : RoomDatabase() {
                 """.trimIndent())
                 db.execSQL("DROP TABLE server_profiles")
                 db.execSQL("ALTER TABLE server_profiles_new RENAME TO server_profiles")
+            }
+        }
+
+
+        val MIGRATION_42_43 = object : Migration(42, 43) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE server_profiles ADD COLUMN vless_failure_provider_id TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE server_profiles ADD COLUMN vless_failure_account_id TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE server_profiles ADD COLUMN vless_failure_hostname TEXT NOT NULL DEFAULT ''")
+            }
+        }
+
+        val MIGRATION_43_44 = object : Migration(43, 44) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE server_profiles ADD COLUMN vless_ech_config_seed TEXT NOT NULL DEFAULT ''")
+                db.execSQL("ALTER TABLE server_profiles ADD COLUMN vless_ech_config_updated_at INTEGER NOT NULL DEFAULT 0")
             }
         }
 

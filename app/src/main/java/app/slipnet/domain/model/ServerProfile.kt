@@ -118,6 +118,14 @@ data class ServerProfile(
     val vlessSecurity: String = "tls",
     val vlessTransport: String = "ws",
     val vlessWsPath: String = "/",
+    // Explicit failure-domain metadata for SlipNet EA route authority.
+    // Blank means this profile is excluded from automatic route switching.
+    val vlessFailureProviderId: String = "",
+    val vlessFailureAccountId: String = "",
+    val vlessFailureHostname: String = "",
+    // Opaque pre-tunnel ECHConfigList seed/cache. Base64-encoded; blank means unavailable.
+    val vlessEchConfigSeed: String = "",
+    val vlessEchConfigUpdatedAt: Long = 0L,
     // CDN IP to connect to (e.g. Cloudflare clean IP)
     val cdnIp: String = "",
     val cdnPort: Int = 443,
@@ -206,10 +214,16 @@ enum class TunnelType(val value: String, val displayName: String) {
     }
 }
 
-fun TunnelType.isAvailable(): Boolean = when (this) {
-    TunnelType.SNOWFLAKE -> BuildConfig.INCLUDE_TOR
-    TunnelType.NAIVE, TunnelType.NAIVE_SSH -> BuildConfig.INCLUDE_NAIVE
-    else -> true
+fun TunnelType.isAvailable(): Boolean {
+    if (BuildConfig.PERSONAL_BUILD) {
+        return this == TunnelType.VLESS ||
+            (BuildConfig.EMERGENCY_DNS_LAB && this == TunnelType.DNSTT)
+    }
+    return when (this) {
+        TunnelType.SNOWFLAKE -> BuildConfig.INCLUDE_TOR
+        TunnelType.NAIVE, TunnelType.NAIVE_SSH -> BuildConfig.INCLUDE_NAIVE
+        else -> true
+    }
 }
 
 enum class SshAuthType(val value: String) {

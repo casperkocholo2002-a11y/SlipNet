@@ -91,6 +91,8 @@ class SniFragmentForwarder(private val instanceId: String = "default") {
     private val connectionThreads = CopyOnWriteArrayList<Thread>()
     private val txBytes = AtomicLong(0)
     private val rxBytes = AtomicLong(0)
+    @Volatile private var lastFragmentWriteCount: Int = 0
+    @Volatile private var lastSniSplitInsideHostname: Boolean = false
 
     fun start(listenPort: Int, listenHost: String = "127.0.0.1"): Result<Unit> {
         Log.i(TAG, "========================================")
@@ -149,6 +151,8 @@ class SniFragmentForwarder(private val instanceId: String = "default") {
     fun isRunning(): Boolean = running.get() && serverSocket?.isClosed == false
     fun getTxBytes(): Long = txBytes.get()
     fun getRxBytes(): Long = rxBytes.get()
+    fun getLastFragmentWriteCount(): Int = lastFragmentWriteCount
+    fun wasLastSniSplitInsideHostname(): Boolean = lastSniSplitInsideHostname
 
     private fun handleConnection(client: Socket) {
         try {
@@ -183,21 +187,20 @@ class SniFragmentForwarder(private val instanceId: String = "default") {
                 }
             }
 
-            // Read first data from client (expected: TLS ClientHello)
-            val buf = ByteArray(BUFFER_SIZE)
-            val n = client.getInputStream().read(buf)
-            if (n <= 0) {
+            // Read the complete first TLS record before rewriting it. A single
+            // Socket.read() is NOT guaranteed to return a whole ClientHello;
+            // fragmenting a partial record would corrupt the TLS byte stream.
+            val firstData = readFirstRecordOrChunk(client.getInputStream())
+            if (firstData.isEmpty()) {
                 client.close(); remote.close(); return
             }
-            val firstData = buf.copyOf(n)
 
-            // If it looks like a TLS ClientHello, fragment it
+            // If it is a complete TLS ClientHello record, fragment it.
             if (isTlsClientHello(firstData)) {
-                // When CH padding is enabled, use micro-fragmentation (1-byte chunks) to
-                // expand the wire size ~6x (each byte gets its own 5-byte TLS record header).
-                // We cannot inject a padding extension because the forwarder sits between
-                // SSLSocket and the server — modifying the ClientHello changes the TLS
-                // transcript hash and breaks the Finished message verification.
+                // Legacy chPaddingEnabled never injected a TLS padding extension. It is
+                // retained only for non-Personal profile compatibility and aliases to the
+                // aggressive micro strategy (many tiny TCP writes plus the MSS cap).
+                // Personal SlipNet EA disables this legacy alias at the service boundary.
                 val effectiveStrategy = if (chPaddingEnabled) "micro" else fragmentStrategy
                 logd("Fragmenting ClientHello (${firstData.size} bytes, strategy=$effectiveStrategy)")
                 when (effectiveStrategy) {
@@ -219,70 +222,83 @@ class SniFragmentForwarder(private val instanceId: String = "default") {
         }
     }
 
+    private fun readFirstRecordOrChunk(input: InputStream): ByteArray {
+        val header = ByteArray(5)
+        var headerRead = 0
+        while (headerRead < header.size) {
+            val n = input.read(header, headerRead, header.size - headerRead)
+            if (n <= 0) return header.copyOf(headerRead)
+            headerRead += n
+        }
+
+        if (header[0] != 0x16.toByte()) return header
+        val recordLength = ((header[3].toInt() and 0xFF) shl 8) or (header[4].toInt() and 0xFF)
+        if (recordLength <= 0 || recordLength > BUFFER_SIZE - 5) return header
+
+        val record = ByteArray(5 + recordLength)
+        System.arraycopy(header, 0, record, 0, 5)
+        var offset = 5
+        while (offset < record.size) {
+            val n = input.read(record, offset, record.size - offset)
+            if (n <= 0) return record.copyOf(offset)
+            offset += n
+        }
+        return record
+    }
+
     private fun isTlsClientHello(data: ByteArray): Boolean {
         // TLS record: ContentType=0x16 (Handshake), Version, Length
-        // Handshake: Type=0x01 (ClientHello)
-        return data.size > 5 &&
-                data[0] == 0x16.toByte() &&
-                data[5] == 0x01.toByte()
+        // Handshake: Type=0x01 (ClientHello). Require the complete declared record.
+        if (data.size <= 5 || data[0] != 0x16.toByte() || data[5] != 0x01.toByte()) return false
+        val declared = ((data[3].toInt() and 0xFF) shl 8) or (data[4].toInt() and 0xFF)
+        return declared > 0 && data.size >= 5 + declared
     }
 
     /**
-     * Fragment the TLS ClientHello using TLS record splitting.
+     * Fragment the original TLS ClientHello byte-stream across multiple TCP writes.
      *
-     * Instead of just splitting TCP segments (which DPI can reassemble),
-     * we split the handshake payload across multiple valid TLS records.
-     * Each record has its own 5-byte TLS header, making it a legitimate
-     * multi-record handshake per RFC 8446. DPI that doesn't reassemble
-     * at the TLS record level will see incomplete SNI in each record.
-     *
-     * Additionally, each TLS record is sent as a separate TCP segment
-     * with a randomized delay to defeat timing-based correlation.
+     * The TLS record bytes are not rewritten. This preserves server compatibility
+     * while still allowing a write boundary (and, with TCP_NODELAY / TCP_MAXSEG,
+     * typically a segment boundary) inside the visible SNI. A DPI that fully
+     * reassembles TCP can still recover ordinary SNI; ECH is the cryptographic
+     * hostname-hiding mode in SlipNet EA.
      */
     private fun sendFragmented(out: OutputStream, data: ByteArray, strategy: String = fragmentStrategy) {
-        // Parse the TLS record header
-        if (data.size < 5) { out.write(data); out.flush(); return }
-        val contentType = data[0]
-        val tlsVersionMajor = data[1]
-        val tlsVersionMinor = data[2]
-        val recordPayload = data.copyOfRange(5, data.size)
-
-        // Determine split points on the handshake payload
-        val splitPoints = when (strategy) {
-            "sni_split" -> getSniSplitPoints(recordPayload)
-            "half" -> getHalfSplitPoints(recordPayload)
-            "multi" -> getMultiSplitPoints(recordPayload)
-            "micro" -> getMicroSplitPoints(recordPayload)
-            else -> getSniSplitPoints(recordPayload)
+        if (data.size < 6) { out.write(data); out.flush(); return }
+        val payload = data.copyOfRange(5, data.size)
+        val payloadSplitPoints = when (strategy) {
+            "sni_split" -> getSniSplitPoints(payload)
+            "half" -> getHalfSplitPoints(payload)
+            "multi" -> getMultiSplitPoints(payload)
+            "micro" -> getMicroSplitPoints(payload)
+            else -> getSniSplitPoints(payload)
         }
+        val splitPoints = payloadSplitPoints
+            .map { (5 + it).coerceIn(1, data.size - 1) }
+            .distinct()
+            .sorted()
 
-        // Build separate TLS records for each fragment
-        val fragments = mutableListOf<ByteArray>()
-        var pos = 0
-        for (splitAt in splitPoints) {
-            if (splitAt > pos && splitAt <= recordPayload.size) {
-                fragments.add(buildTlsRecord(contentType, tlsVersionMajor, tlsVersionMinor, recordPayload, pos, splitAt - pos))
-                pos = splitAt
-            }
+        val sniOffset = findSniHostnameOffset(payload)
+        val hostnameLen = if (sniOffset >= 2) {
+            ((payload[sniOffset - 2].toInt() and 0xFF) shl 8) or (payload[sniOffset - 1].toInt() and 0xFF)
+        } else 0
+        lastSniSplitInsideHostname = strategy == "sni_split" && payloadSplitPoints.any {
+            hostnameLen > 1 && it > sniOffset && it < sniOffset + hostnameLen
         }
-        if (pos < recordPayload.size) {
-            fragments.add(buildTlsRecord(contentType, tlsVersionMajor, tlsVersionMinor, recordPayload, pos, recordPayload.size - pos))
-        }
+        lastFragmentWriteCount = splitPoints.size + 1
+        logd("Sending $lastFragmentWriteCount TCP fragments (strategy=$strategy, sniBoundary=$lastSniSplitInsideHostname)")
 
-        logd("Sending ${fragments.size} TLS record fragments (strategy=$strategy)")
-
-        // Send each TLS record as a separate TCP segment with randomized delay.
-        // Micro uses a small per-record jitter derived from the user's
-        // `fragmentDelayMs` (≈ delay/4, clamped). The point isn't to be slow,
-        // it's to force DPI reassembly state to be held across many records
-        // until stateful middleboxes time out and drop tracking.
         val isMicro = strategy == "micro"
         val useDelay = if (isMicro) true else fragmentDelayMs > 0
         val microJitterMax = (fragmentDelayMs / 10).coerceIn(MICRO_JITTER_MIN_MS, MICRO_JITTER_MAX_MS)
-        for ((i, fragment) in fragments.withIndex()) {
-            out.write(fragment)
+        var pos = 0
+        val boundaries = splitPoints + data.size
+        for ((i, splitAt) in boundaries.withIndex()) {
+            if (splitAt <= pos) continue
+            out.write(data, pos, splitAt - pos)
             out.flush()
-            if (i < fragments.size - 1 && useDelay) {
+            pos = splitAt
+            if (i < boundaries.size - 1 && useDelay) {
                 val delay = if (isMicro) {
                     MICRO_JITTER_MIN_MS + random.nextInt(microJitterMax - MICRO_JITTER_MIN_MS + 1)
                 } else {
@@ -418,8 +434,10 @@ class SniFragmentForwarder(private val instanceId: String = "default") {
     // ── Split point calculators (offsets within handshake payload, excluding TLS header) ──
 
     /**
-     * Split through the middle of the SNI hostname with a random offset.
-     * Also prepends a 1-byte first fragment to defeat DPI that only checks the first packet.
+     * Split through the SNI hostname while keeping the 4-byte TLS Handshake
+     * header contiguous. Some real TLS stacks reject/tolerate poorly a record
+     * boundary inside that header even though handshake messages can span
+     * records. The privacy-relevant split is inside the hostname itself.
      */
     private fun getSniSplitPoints(payload: ByteArray): List<Int> {
         val sniOffset = findSniHostnameOffset(payload)
@@ -434,19 +452,17 @@ class SniFragmentForwarder(private val instanceId: String = "default") {
                 sniOffset + (payload.size - sniOffset) / 2
             }
             val splitPoint = mid.coerceIn(2, payload.size - 1)
-            logd("SNI split: 1-byte lead + split at $splitPoint (hostname at $sniOffset, len=$hostnameLen)")
-            // 1-byte first fragment + split at SNI
-            return listOf(1, splitPoint)
+            logd("SNI split at $splitPoint (hostname at $sniOffset, len=$hostnameLen)")
+            return listOf(splitPoint)
         }
         return getHalfSplitPoints(payload)
     }
 
-    /**
-     * 1-byte first fragment + split the rest in half.
-     */
+    /** Split the handshake payload in half without splitting its 4-byte header. */
     private fun getHalfSplitPoints(payload: ByteArray): List<Int> {
-        val mid = 1 + (payload.size - 1) / 2
-        return listOf(1, mid)
+        if (payload.size <= 5) return emptyList()
+        val mid = (4 + (payload.size - 4) / 2).coerceIn(5, payload.size - 1)
+        return listOf(mid)
     }
 
     /**
@@ -454,9 +470,8 @@ class SniFragmentForwarder(private val instanceId: String = "default") {
      */
     private fun getMultiSplitPoints(payload: ByteArray): List<Int> {
         val points = mutableListOf<Int>()
-        // Always start with a 1-byte fragment
-        var pos = 1
-        points.add(pos)
+        // Keep the 4-byte handshake header intact, then split the body.
+        var pos = 4
         while (pos < payload.size) {
             val chunkSize = MULTI_CHUNK_MIN + random.nextInt(MULTI_CHUNK_MAX - MULTI_CHUNK_MIN + 1)
             pos += chunkSize
@@ -468,12 +483,13 @@ class SniFragmentForwarder(private val instanceId: String = "default") {
     }
 
     /**
-     * Micro-fragmentation: split into 1-byte chunks for maximum wire overhead.
-     * Each byte gets its own 5-byte TLS record header, expanding wire size ~6x.
-     * This makes every individual packet useless to DPI without reassembly.
+     * Micro-fragmentation keeps the 4-byte handshake header contiguous, then
+     * emits one-byte body fragments. This preserves aggressive record-level
+     * fragmentation without placing a record boundary inside the message header.
      */
     private fun getMicroSplitPoints(payload: ByteArray): List<Int> {
-        return (1 until payload.size).toList()
+        if (payload.size <= 5) return emptyList()
+        return (5 until payload.size).toList()
     }
 
     /**

@@ -28,7 +28,7 @@ class ConfigExporter @Inject constructor() {
         const val ENCRYPTED_SCHEME = "slipnet-enc://"
         /** Scheme for password-encrypted multi-profile bundles (see [exportAllProfilesEncrypted]). */
         const val BUNDLE_ENCRYPTED_SCHEME = "slipnet-bundle-enc://"
-        const val VERSION = "28"
+        const val VERSION = "29"
         const val MODE_SLIPSTREAM = "ss"
         const val MODE_SLIPSTREAM_SSH = "slipstream_ssh"
         const val MODE_DNSTT = "dnstt"
@@ -275,7 +275,15 @@ class ConfigExporter @Inject constructor() {
             // v28: Single TLS SNI for VLESS. Empty = the bridge falls back to
             // profile.domain (the WS Host). Replaces the legacy position-71
             // field that v25–v27 used.
-            sanitize(profile.vlessSni)
+            sanitize(profile.vlessSni),
+            // v29: SlipNet EA explicit failover domains + opaque ECH bootstrap.
+            // The ECHConfigList is configuration material, not a credential; carrying
+            // it in the already-existing export envelope avoids pre-tunnel DNS lookup.
+            sanitize(profile.vlessFailureProviderId),
+            sanitize(profile.vlessFailureAccountId),
+            sanitize(profile.vlessFailureHostname),
+            sanitize(profile.vlessEchConfigSeed),
+            profile.vlessEchConfigUpdatedAt.toString()
         ).joinToString(FIELD_DELIMITER)
     }
 

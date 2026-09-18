@@ -63,7 +63,7 @@ fun isOpenSslAvailable(): Boolean {
 android {
     val javaVersion = JavaVersion.VERSION_17
     namespace = "app.slipnet"
-    compileSdk = 36
+    compileSdk = 37
     compileOptions {
         sourceCompatibility = javaVersion
         targetCompatibility = javaVersion
@@ -88,6 +88,13 @@ android {
         versionName = appVersionName
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        // Opt-in build gate. Production/personal builds keep the emergency DNS
+        // transport disabled unless a dedicated lab flavor overrides this.
+        buildConfigField("boolean", "EMERGENCY_DNS_LAB", "false")
+        // Edition-specific update authority. Personal builds must never follow
+        // the public upstream release channel; a controlled URL can be enabled
+        // later without changing UpdateChecker logic.
+        buildConfigField("String", "UPDATE_API_URL", "\"https://api.github.com/repos/anonvector/SlipNet/releases/latest\"")
 
     }
 
@@ -95,15 +102,42 @@ android {
     productFlavors {
         create("full") {
             dimension = "edition"
+            buildConfigField("boolean", "PERSONAL_BUILD", "false")
             buildConfigField("boolean", "INCLUDE_TOR", "true")
             buildConfigField("boolean", "INCLUDE_NAIVE", "true")
         }
         create("lite") {
             dimension = "edition"
+            buildConfigField("boolean", "PERSONAL_BUILD", "false")
             applicationIdSuffix = ".lite"
             versionNameSuffix = "-lite"
             buildConfigField("boolean", "INCLUDE_TOR", "false")
             buildConfigField("boolean", "INCLUDE_NAIVE", "false")
+        }
+        create("personal") {
+            dimension = "edition"
+            applicationIdSuffix = ".personal"
+            versionNameSuffix = "-personal"
+            buildConfigField("boolean", "INCLUDE_TOR", "false")
+            buildConfigField("boolean", "INCLUDE_NAIVE", "false")
+            buildConfigField("boolean", "PERSONAL_BUILD", "true")
+            buildConfigField("boolean", "INCLUDE_DNSTT", "false")
+            buildConfigField("boolean", "INCLUDE_VAYDNS", "false")
+            buildConfigField("boolean", "INCLUDE_SLIPSTREAM", "false")
+            buildConfigField("String", "UPDATE_API_URL", "\"\"")
+        }
+        create("dnsLab") {
+            dimension = "edition"
+            applicationIdSuffix = ".dnslab"
+            versionNameSuffix = "-dns-lab"
+            buildConfigField("boolean", "PERSONAL_BUILD", "true")
+            buildConfigField("boolean", "EMERGENCY_DNS_LAB", "true")
+            buildConfigField("boolean", "INCLUDE_TOR", "false")
+            buildConfigField("boolean", "INCLUDE_NAIVE", "false")
+            buildConfigField("boolean", "INCLUDE_DNSTT", "true")
+            buildConfigField("boolean", "INCLUDE_VAYDNS", "false")
+            buildConfigField("boolean", "INCLUDE_SLIPSTREAM", "false")
+            buildConfigField("String", "UPDATE_API_URL", "\"\"")
         }
     }
 
@@ -120,6 +154,10 @@ android {
         compose = true
         buildConfig = true
     }
+
+    sourceSets["androidTest"].assets.srcDir("$projectDir/schemas")
+    sourceSets["dnsLab"].java.srcDir("src/personal/java")
+    sourceSets["dnsLab"].java.exclude("mobile/**")
 
     applicationVariants.all {
         outputs.all {
@@ -399,15 +437,14 @@ tasks.register<Exec>("cargoClean") {
     args("clean")
     workingDir("$projectDir/${cargo.module}")
 }
-tasks.named("clean") {
-    dependsOn("cargoClean")
-}
 
 dependencies {
+    implementation("org.conscrypt:conscrypt-android:2.7.0")
     // Go libraries — flavor-specific AARs built via: cd gomobile-build && make build
     // Full: DNSTT + Snowflake, Lite: DNSTT only (smaller binary)
     "fullImplementation"(files("libs/golibs-full.aar"))
     "liteImplementation"(files("libs/golibs-lite.aar"))
+    "dnsLabImplementation"(files("libs/dnstt.aar"))
 
     // Tor binary for Snowflake tunnel — libtor.so extracted from
     // info.guardianproject:tor-android:0.4.9.5 into jniLibs/

@@ -39,6 +39,9 @@ interface ProfileDao {
     @Query("UPDATE server_profiles SET last_connected_at = :timestamp WHERE id = :id")
     suspend fun updateLastConnectedAt(id: Long, timestamp: Long)
 
+    @Query("UPDATE server_profiles SET vless_ech_config_seed = :encodedSeed, vless_ech_config_updated_at = :updatedAt WHERE id = :id")
+    suspend fun updateVlessEchSeed(id: Long, encodedSeed: String, updatedAt: Long): Int
+
     @Query("SELECT MAX(sort_order) FROM server_profiles")
     suspend fun getMaxSortOrder(): Int?
 

@@ -267,7 +267,7 @@ fun MainScreen(
     ) { result ->
         val contents = result.contents
         if (contents != null) {
-            if (contents.startsWith("slipnet://") || contents.startsWith("slipnet-enc://") || contents.startsWith("vless://")) {
+            if (contents.startsWith("slipnet://") || contents.startsWith("slipnet-enc://") || contents.startsWith("slipnet-bundle-enc://") || contents.startsWith("vless://")) {
                 viewModel.parseImportConfig(contents)
             } else {
                 scope.launch {
@@ -826,6 +826,7 @@ fun MainScreen(
                 downloadSpeed = uiState.downloadSpeed,
                 totalUpload = uiState.trafficStats.bytesSent,
                 totalDownload = uiState.trafficStats.bytesReceived,
+                isSubscriptionUsage = uiState.activeProfile?.isLocked == true,
                 sleepTimerRemainingSeconds = uiState.sleepTimerRemainingSeconds,
                 onCancelSleepTimer = { viewModel.userCancelSleepTimer() },
                 dnsWarning = uiState.dnsWarning,
@@ -1918,6 +1919,7 @@ private fun ConnectionStatusStrip(
     downloadSpeed: Long = 0,
     totalUpload: Long = 0,
     totalDownload: Long = 0,
+    isSubscriptionUsage: Boolean = false,
     sleepTimerRemainingSeconds: Int = 0,
     onCancelSleepTimer: () -> Unit = {},
     dnsWarning: String? = null,
@@ -2029,9 +2031,10 @@ private fun ConnectionStatusStrip(
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                         Spacer(modifier = Modifier.weight(1f))
-                        // Session totals
+                        // Subscription total for managed profiles; session total otherwise.
                         Text(
-                            text = "\u2191 ${TrafficStats.formatBytes(totalUpload)}  \u2193 ${TrafficStats.formatBytes(totalDownload)}",
+                            text = (if (isSubscriptionUsage) "Subscription  " else "Session  ") +
+                                "\u2191 ${TrafficStats.formatBytes(totalUpload)}  \u2193 ${TrafficStats.formatBytes(totalDownload)}",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
                         )

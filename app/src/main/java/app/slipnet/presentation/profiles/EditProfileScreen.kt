@@ -103,6 +103,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import app.slipnet.BuildConfig
 import app.slipnet.domain.model.CongestionControl
 import app.slipnet.domain.model.DnsTransport
 import app.slipnet.domain.model.ResolverMode
@@ -177,6 +178,59 @@ fun EditProfileScreen(
             snackbarHostState.showSnackbar(error)
             viewModel.clearError()
         }
+    }
+
+    if (uiState.isLocked && BuildConfig.APPLICATION_ID == "app.slipnet.personal" && !uiState.isLoading) {
+        Scaffold(
+            topBar = {
+                TopAppBar(
+                    title = { Text("Managed Profile") },
+                    navigationIcon = {
+                        IconButton(onClick = onNavigateBack) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        }
+                    }
+                )
+            },
+            snackbarHost = { SnackbarHost(snackbarHostState) }
+        ) { paddingValues ->
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(paddingValues)
+                    .padding(24.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Lock,
+                    contentDescription = null,
+                    modifier = Modifier.size(36.dp),
+                    tint = MaterialTheme.colorScheme.primary
+                )
+                Text(
+                    text = uiState.name,
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = "This subscription profile is managed by the provider. Server addresses, credentials, routing details, editing, export and re-sharing are disabled on this device.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                if (uiState.expirationDate > 0) {
+                    val dateStr = java.text.SimpleDateFormat(
+                        "MMM dd, yyyy HH:mm",
+                        java.util.Locale.getDefault()
+                    ).format(java.util.Date(uiState.expirationDate))
+                    LockedInfoRow(
+                        icon = Icons.Default.Schedule,
+                        label = "Subscription expires",
+                        value = dateStr
+                    )
+                }
+            }
+        }
+        return
     }
 
     Scaffold(
@@ -1386,17 +1440,99 @@ fun EditProfileScreen(
                         )
                     }
 
+                    Text(
+                        text = "Failover Authority",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(top = 8.dp)
+                    )
+                    Text(
+                        text = "Optional explicit failure-domain metadata. Leave any field blank to keep this profile out of automatic failover. Values are never inferred.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    OutlinedTextField(
+                        value = uiState.vlessFailureProviderId,
+                        onValueChange = { viewModel.updateVlessFailureProviderId(it) },
+                        label = { Text("Provider ID") },
+                        placeholder = { Text("provider-a") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedTextField(
+                        value = uiState.vlessFailureAccountId,
+                        onValueChange = { viewModel.updateVlessFailureAccountId(it) },
+                        label = { Text("Account ID") },
+                        placeholder = { Text("account-a") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedTextField(
+                        value = uiState.vlessFailureHostname,
+                        onValueChange = { viewModel.updateVlessFailureHostname(it) },
+                        label = { Text("Failure Hostname") },
+                        placeholder = { Text("failure-domain.example") },
+                        supportingText = { Text("Explicit failure-domain identity only; do not copy the protected SNI unless it is truly the same failure domain.") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
                     // TLS DPI bypass options (only relevant when security=tls)
                     if (uiState.vlessSecurity == "tls") {
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = if (uiState.sniFragmentEnabled)
+                                    "SNI Fragmentation is active. In SlipNet EA this is a separate mode and ECH is disabled for this connection."
+                                else
+                                    "SlipNet EA privacy mode: ECH_REQUIRED uses the stored ECH seed and fails closed if ECH cannot be established.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                modifier = Modifier.padding(12.dp)
+                            )
+                        }
                         OutlinedTextField(
                             value = uiState.vlessSni,
                             onValueChange = { viewModel.updateVlessSni(it) },
                             label = { Text("TLS SNI") },
                             placeholder = { Text("leave empty to use WS Host") },
-                            supportingText = { Text("Sent in the TLS ClientHello. Must match the CDN cert hostname for CDN routing; on direct servers any hostname works.") },
+                            supportingText = {
+                                Text(
+                                    if (BuildConfig.PERSONAL_BUILD && !uiState.sniFragmentEnabled)
+                                        "Protected inner TLS hostname. SlipNet EA encrypts it with required ECH."
+                                    else
+                                        "TLS hostname used by the selected transport mode."
+                                )
+                            },
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth()
                         )
+
+                        if (BuildConfig.PERSONAL_BUILD) {
+                            Card(
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)
+                            ) {
+                                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Text(
+                                        if (uiState.sniFragmentEnabled) "Domain privacy: SNI Fragment mode" else "Domain privacy: ECH required",
+                                        style = MaterialTheme.typography.titleSmall
+                                    )
+                                    Text(
+                                        if (uiState.sniFragmentEnabled)
+                                            "Fragmentation is an alternative transport mode, not cryptographic hostname hiding. ECH is disabled while Fragment is enabled."
+                                        else if (uiState.vlessEchConfigSeed.isNotBlank())
+                                            "ECH bootstrap seed is available. Missing/invalid ECH fails closed without protected-domain DNS fallback."
+                                        else
+                                            "ECH bootstrap seed is missing. This profile will fail closed until a trusted seed is provisioned.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
 
                         // SNI Fragmentation section
                         Row(
@@ -1478,26 +1614,36 @@ fun EditProfileScreen(
                                 onValueChange = { viewModel.updateTcpMaxSeg(it) },
                                 label = { Text("Force TCP MSS (advanced)") },
                                 placeholder = { Text("0") },
-                                supportingText = { Text("Cap outgoing TCP segment size so each TLS record spills across multiple segments. 0 = auto (on only in Micro / CH-padding). 40–1400 = explicit override; 70 is a good starting point against per-segment DPI. Smaller = slower throughput.") },
+                                supportingText = { Text("Cap outgoing TCP segment size so each TLS record spills across multiple segments. 0 = auto (on only in Micro / legacy aggressive micro mode). 40–1400 = explicit override; 70 is a good starting point against per-segment DPI. Smaller = slower throughput.") },
                                 singleLine = true,
                                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                                 modifier = Modifier.fillMaxWidth()
                             )
                         }
 
-                        // ClientHello padding
+                        // Legacy setting retained in storage for profile compatibility.
+                        // It never implemented a TLS padding extension; it forced aggressive
+                        // one-byte TCP writes plus a tiny MSS and is disabled in Personal.
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
-                                Text("ClientHello Padding", style = MaterialTheme.typography.bodyLarge)
-                                Text("Micro-fragment each byte into its own TLS record (~6x wire expansion)", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text("Aggressive Micro Fragmentation (legacy)", style = MaterialTheme.typography.bodyLarge)
+                                Text(
+                                    if (BuildConfig.PERSONAL_BUILD)
+                                        "Disabled in SlipNet EA Personal. This was not ClientHello padding and could severely reduce throughput and increase heat."
+                                    else
+                                        "One-byte TCP writes with jitter and an MSS cap. This is not TLS ClientHello padding and can severely reduce throughput.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
                             }
                             Switch(
-                                checked = uiState.chPaddingEnabled,
-                                onCheckedChange = { viewModel.updateChPaddingEnabled(it) }
+                                checked = if (BuildConfig.PERSONAL_BUILD) false else uiState.chPaddingEnabled,
+                                onCheckedChange = { viewModel.updateChPaddingEnabled(it) },
+                                enabled = !BuildConfig.PERSONAL_BUILD
                             )
                         }
 

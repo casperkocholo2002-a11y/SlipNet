@@ -5,6 +5,7 @@ import android.net.ConnectivityManager
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import app.slipnet.BuildConfig
 import app.slipnet.domain.model.CongestionControl
 import app.slipnet.domain.model.DnsResolver
 import app.slipnet.domain.model.ResolverMode
@@ -206,11 +207,18 @@ data class EditProfileUiState(
     val vlessSecurity: String = "tls",
     val vlessTransport: String = "ws",
     val vlessWsPath: String = "/",
+    // Explicit failure-domain metadata. Blank means failover-ineligible; never inferred.
+    val vlessFailureProviderId: String = "",
+    val vlessFailureAccountId: String = "",
+    val vlessFailureHostname: String = "",
+    // Opaque ECH bootstrap state is preserved across edits but never exposed in ordinary UI.
+    val vlessEchConfigSeed: String = "",
+    val vlessEchConfigUpdatedAt: Long = 0L,
     val cdnIp: String = "",
     val cdnIpError: String? = null,
     val cdnPort: String = "443",
     val cdnPortError: String? = null,
-    val sniFragmentEnabled: Boolean = true,
+    val sniFragmentEnabled: Boolean = !BuildConfig.PERSONAL_BUILD,
     val sniFragmentStrategy: String = "micro",
     val sniFragmentDelayMs: String = "300",
     val sniSpoofTtl: String = "8",
@@ -420,6 +428,11 @@ class EditProfileViewModel @Inject constructor(
                     vlessSecurity = profile.vlessSecurity,
                     vlessTransport = profile.vlessTransport,
                     vlessWsPath = profile.vlessWsPath,
+                    vlessFailureProviderId = profile.vlessFailureProviderId,
+                    vlessFailureAccountId = profile.vlessFailureAccountId,
+                    vlessFailureHostname = profile.vlessFailureHostname,
+                    vlessEchConfigSeed = profile.vlessEchConfigSeed,
+                    vlessEchConfigUpdatedAt = profile.vlessEchConfigUpdatedAt,
                     cdnIp = profile.cdnIp,
                     cdnPort = profile.cdnPort.toString(),
                     sniFragmentEnabled = profile.sniFragmentEnabled,
@@ -650,6 +663,15 @@ class EditProfileViewModel @Inject constructor(
     }
     fun updateVlessWsPath(path: String) {
         _uiState.value = _uiState.value.copy(vlessWsPath = path)
+    }
+    fun updateVlessFailureProviderId(value: String) {
+        _uiState.value = _uiState.value.copy(vlessFailureProviderId = value)
+    }
+    fun updateVlessFailureAccountId(value: String) {
+        _uiState.value = _uiState.value.copy(vlessFailureAccountId = value)
+    }
+    fun updateVlessFailureHostname(value: String) {
+        _uiState.value = _uiState.value.copy(vlessFailureHostname = value)
     }
     fun updateCdnIp(ip: String) {
         _uiState.value = _uiState.value.copy(cdnIp = ip, cdnIpError = null)
@@ -1548,6 +1570,11 @@ class EditProfileViewModel @Inject constructor(
                     vlessSecurity = if (state.isVless) state.vlessSecurity else "tls",
                     vlessTransport = if (state.isVless) state.vlessTransport else "ws",
                     vlessWsPath = if (state.isVless) state.vlessWsPath.ifBlank { "/" } else "/",
+                    vlessFailureProviderId = if (state.isVless) state.vlessFailureProviderId.trim() else "",
+                    vlessFailureAccountId = if (state.isVless) state.vlessFailureAccountId.trim() else "",
+                    vlessFailureHostname = if (state.isVless) state.vlessFailureHostname.trim() else "",
+                    vlessEchConfigSeed = if (state.isVless) state.vlessEchConfigSeed else "",
+                    vlessEchConfigUpdatedAt = if (state.isVless) state.vlessEchConfigUpdatedAt else 0L,
                     cdnIp = if (state.isVless) state.cdnIp.trim() else "",
                     cdnPort = if (state.isVless) (state.cdnPort.toIntOrNull() ?: 443) else 443,
                     sniFragmentEnabled = if (state.isVless) state.sniFragmentEnabled else true,

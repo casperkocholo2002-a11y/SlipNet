@@ -124,3 +124,10 @@ cli/slipnet.exe
 
 # Claude Code local config
 .claude/
+
+# Python/server local artifacts and secrets
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example

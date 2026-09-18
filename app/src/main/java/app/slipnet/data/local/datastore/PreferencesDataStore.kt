@@ -95,6 +95,9 @@ class PreferencesDataStore @Inject constructor(
         val DNS_POOL_ENABLED = booleanPreferencesKey("dns_pool_enabled")
         val DNS_POOL_TEXT = stringPreferencesKey("dns_pool_text")
         val DNS_POOL_FULL_VERIFICATION = booleanPreferencesKey("dns_pool_full_verification")
+        // Emergency DNS resolver-learning cache. Contains only hashed network scope ids
+        // and resolver health counters; raw SSID/BSSID/network identity is never stored.
+        val EMERGENCY_DNS_RESOLVER_MEMORY = stringPreferencesKey("emergency_dns_resolver_memory_v1")
         // DNS Leak Prevention
         val PREVENT_DNS_FALLBACK = booleanPreferencesKey("prevent_dns_fallback")
         // Notification Traffic Counter
@@ -206,6 +209,34 @@ class PreferencesDataStore @Inject constructor(
             prefs[Keys.TOTAL_BYTES_SENT] = 0L
             prefs[Keys.TOTAL_BYTES_RECEIVED] = 0L
             prefs[Keys.TOTAL_CONNECTION_TIME] = 0L
+        }
+    }
+
+    private fun managedUsageSentKey(profileId: Long) =
+        longPreferencesKey("managed_profile_${profileId}_bytes_sent")
+
+    private fun managedUsageReceivedKey(profileId: Long) =
+        longPreferencesKey("managed_profile_${profileId}_bytes_received")
+
+    suspend fun getManagedProfileUsage(profileId: Long): Pair<Long, Long> {
+        val prefs = dataStore.data.first()
+        return Pair(
+            prefs[managedUsageSentKey(profileId)] ?: 0L,
+            prefs[managedUsageReceivedKey(profileId)] ?: 0L
+        )
+    }
+
+    suspend fun setManagedProfileUsage(profileId: Long, bytesSent: Long, bytesReceived: Long) {
+        dataStore.edit { prefs ->
+            prefs[managedUsageSentKey(profileId)] = bytesSent.coerceAtLeast(0L)
+            prefs[managedUsageReceivedKey(profileId)] = bytesReceived.coerceAtLeast(0L)
+        }
+    }
+
+    suspend fun resetManagedProfileUsage(profileId: Long) {
+        dataStore.edit { prefs ->
+            prefs.remove(managedUsageSentKey(profileId))
+            prefs.remove(managedUsageReceivedKey(profileId))
         }
     }
 
@@ -737,6 +768,19 @@ class PreferencesDataStore @Inject constructor(
 
     suspend fun setGlobalResolverList(list: String) {
         dataStore.edit { it[Keys.GLOBAL_RESOLVER_LIST] = list }
+    }
+
+    // --- Emergency DNS resolver memory ---
+
+    val emergencyDnsResolverMemory: Flow<String> = dataStore.data.map { prefs ->
+        prefs[Keys.EMERGENCY_DNS_RESOLVER_MEMORY] ?: ""
+    }
+
+    suspend fun setEmergencyDnsResolverMemory(encoded: String) {
+        dataStore.edit { prefs ->
+            if (encoded.isBlank()) prefs.remove(Keys.EMERGENCY_DNS_RESOLVER_MEMORY)
+            else prefs[Keys.EMERGENCY_DNS_RESOLVER_MEMORY] = encoded
+        }
     }
 
     // --- Global DNS Pool (shared across DNSTT/NoizDNS/VayDNS profiles) ---

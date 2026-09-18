@@ -133,7 +133,7 @@ class ConfigImporter @Inject constructor() {
         private const val V16_FIELD_COUNT = 36
         private const val V17_FIELD_COUNT = 38
         private const val V18_FIELD_COUNT = 41
-        private const val CURRENT_MAX_VERSION = 28
+        private const val CURRENT_MAX_VERSION = 29
         private const val VLESS_SCHEME = "vless://"
     }
 
@@ -309,12 +309,13 @@ class ConfigImporter @Inject constructor() {
             "26" -> parseProfileV26(fields, lineNum)
             "27" -> parseProfileV27(fields, lineNum)
             "28" -> parseProfileV28(fields, lineNum)
+            "29" -> parseProfileV29(fields, lineNum)
             else -> {
                 // Forward compatibility: try the highest known parser for newer versions.
                 // Extra trailing fields are safely ignored (parsers only check minimum count).
                 val versionNum = version.toIntOrNull()
-                if (versionNum != null && versionNum > 28) {
-                    parseProfileV28(fields, lineNum)
+                if (versionNum != null && versionNum > 29) {
+                    parseProfileV29(fields, lineNum)
                 } else {
                     ProfileParseResult.Error("Line $lineNum: Unsupported version '$version'")
                 }
@@ -2440,6 +2441,25 @@ class ConfigImporter @Inject constructor() {
         } else {
             baseResult
         }
+    }
+
+    // v29 carries SlipNet EA explicit failure-domain metadata and the opaque
+    // pre-tunnel ECHConfigList seed/cache. Older exports remain blank/default.
+    private fun parseProfileV29(fields: List<String>, lineNum: Int): ProfileParseResult {
+        val baseResult = parseProfileV28(fields, lineNum)
+        if (baseResult !is ProfileParseResult.Success) return baseResult
+        if (fields.size < 84) {
+            return ProfileParseResult.Error("Line $lineNum: Invalid v29 format (expected 84 fields, got ${fields.size})")
+        }
+        return ProfileParseResult.Success(
+            baseResult.profile.copy(
+                vlessFailureProviderId = fields[79],
+                vlessFailureAccountId = fields[80],
+                vlessFailureHostname = fields[81],
+                vlessEchConfigSeed = fields[82],
+                vlessEchConfigUpdatedAt = fields[83].toLongOrNull() ?: 0L,
+            )
+        )
     }
 
     private fun parseResolvers(resolversStr: String): List<DnsResolver> {

@@ -1,5 +1,6 @@
 package app.slipnet.util
 
+import app.slipnet.BuildConfig
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -28,7 +29,7 @@ object AppLog {
     private val buffer = ArrayDeque<LogEntry>()
 
     /** When true, sensitive config details are redacted from the in-app log buffer. */
-    @Volatile var redactSensitive = false
+    @Volatile var redactSensitive = BuildConfig.PERSONAL_BUILD
 
     // Lazy snapshot — only rebuilt when the debug sheet is open (observerCount > 0).
     private val _lines = MutableStateFlow<List<LogEntry>>(emptyList())
@@ -42,6 +43,28 @@ object AppLog {
     // Avoids creating an ArrayList copy on every single log call — instead
     // the UI polls via flushIfDirty() on each collection (every frame).
     private val dirty = AtomicBoolean(false)
+
+    // Privacy-safe operational telemetry. This channel intentionally accepts
+    // only fixed-format event/key tokens plus numeric values, so callers cannot
+    // accidentally place hostnames, SNI, UUIDs, credentials or ECH material in
+    // the in-app ring buffer.
+    private const val OPERATIONAL_TAG = "SlipNetOps"
+    private val OP_EVENT_TOKEN = Regex("^[A-Z][A-Z0-9_]{0,47}$")
+    private val OP_METRIC_KEY = Regex("^[a-z][a-z0-9_]{0,31}$")
+
+    fun operational(event: String, vararg metrics: Pair<String, Long>): Int {
+        if (!OP_EVENT_TOKEN.matches(event) || metrics.any { !OP_METRIC_KEY.matches(it.first) }) {
+            return android.util.Log.w(OPERATIONAL_TAG, "OP_EVENT_REJECTED")
+        }
+        val message = buildString {
+            append(event)
+            metrics.forEach { (key, value) ->
+                append(';').append(key).append('=').append(value)
+            }
+        }
+        append('I', OPERATIONAL_TAG, message)
+        return android.util.Log.i(OPERATIONAL_TAG, message)
+    }
 
     private val dateFormat = object : ThreadLocal<SimpleDateFormat>() {
         override fun initialValue() = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US)
@@ -106,6 +129,7 @@ object AppLog {
         "NaiveBridge",
         "VpnRepositoryImpl",
         "VaydnsBridge",
+        "VlessBridge",
         "DnsResolverProber",
         "DohBridge",
         "HttpProxyServer",
@@ -119,7 +143,7 @@ object AppLog {
     )
 
     /** Tag prefixes for dynamic tags (e.g. SshTunnel[default], Socks5Proxy[0]). */
-    private val SENSITIVE_TAG_PREFIXES = arrayOf("SshTunnel[", "Socks5Proxy[")
+    private val SENSITIVE_TAG_PREFIXES = arrayOf("SshTunnel[", "Socks5Proxy[", "SniFragment[")
 
     /**
      * Check if this log line should be redacted from the in-app buffer.
@@ -132,41 +156,46 @@ object AppLog {
         return SENSITIVE_TAG_PREFIXES.any { tag.startsWith(it) }
     }
 
+    private fun logcatMessage(tag: String, msg: String): String =
+        if (shouldRedact(tag)) "[redacted-personal]" else msg
+
     fun v(tag: String, msg: String): Int {
         if (!shouldRedact(tag)) append('V', tag, msg)
-        return android.util.Log.v(tag, msg)
+        return android.util.Log.v(tag, logcatMessage(tag, msg))
     }
 
     fun d(tag: String, msg: String): Int {
         if (!shouldRedact(tag)) append('D', tag, msg)
-        return android.util.Log.d(tag, msg)
+        return android.util.Log.d(tag, logcatMessage(tag, msg))
     }
 
     fun i(tag: String, msg: String): Int {
         if (!shouldRedact(tag)) append('I', tag, msg)
-        return android.util.Log.i(tag, msg)
+        return android.util.Log.i(tag, logcatMessage(tag, msg))
     }
 
     fun w(tag: String, msg: String): Int {
         if (!shouldRedact(tag)) append('W', tag, msg)
-        return android.util.Log.w(tag, msg)
+        return android.util.Log.w(tag, logcatMessage(tag, msg))
     }
 
     @JvmStatic
     fun w(tag: String, msg: String, tr: Throwable?): Int {
-        if (!shouldRedact(tag)) append('W', tag, if (tr != null) "$msg\n${tr.stackTraceToString()}" else msg)
-        return android.util.Log.w(tag, msg, tr)
+        val redact = shouldRedact(tag)
+        if (!redact) append('W', tag, if (tr != null) "$msg\n${tr.stackTraceToString()}" else msg)
+        return if (redact) android.util.Log.w(tag, "[redacted-personal]") else android.util.Log.w(tag, msg, tr)
     }
 
     fun e(tag: String, msg: String): Int {
         if (!shouldRedact(tag)) append('E', tag, msg)
-        return android.util.Log.e(tag, msg)
+        return android.util.Log.e(tag, logcatMessage(tag, msg))
     }
 
     @JvmStatic
     fun e(tag: String, msg: String, tr: Throwable?): Int {
-        if (!shouldRedact(tag)) append('E', tag, if (tr != null) "$msg\n${tr.stackTraceToString()}" else msg)
-        return android.util.Log.e(tag, msg, tr)
+        val redact = shouldRedact(tag)
+        if (!redact) append('E', tag, if (tr != null) "$msg\n${tr.stackTraceToString()}" else msg)
+        return if (redact) android.util.Log.e(tag, "[redacted-personal]") else android.util.Log.e(tag, msg, tr)
     }
 
     fun clear() {

@@ -13,6 +13,7 @@ interface ProfileRepository {
     suspend fun setActiveProfile(id: Long)
     suspend fun clearActiveProfile()
     suspend fun updateLastConnectedAt(id: Long)
+    suspend fun updateVlessEchSeed(id: Long, encodedSeed: String, updatedAt: Long): Boolean
     suspend fun updateProfileOrder(orderedIds: List<Long>)
     suspend fun getMaxSortOrder(): Int
     suspend fun prepareTopSortOrder()
