@@ -16,12 +16,19 @@ if [[ -z "$UNSIGNED" ]]; then
 fi
 SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/home/reos/Android/Sdk}}"
 APKSIGNER="$SDK_ROOT/build-tools/37.0.0/apksigner"
+AAPT2="$SDK_ROOT/build-tools/37.0.0/aapt2"
 TMP="$(mktemp -d /tmp/slipnet-ea-release-gate-test.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
 
 [[ -x "$GATE" ]] || fail 'gate_not_executable'
 [[ -f "$UNSIGNED" ]] || fail 'unsigned_release_missing'
 [[ -x "$APKSIGNER" ]] || fail 'apksigner_missing'
+[[ -x "$AAPT2" ]] || fail 'aapt2_missing'
+
+BADGING="$("$AAPT2" dump badging "$UNSIGNED" 2>/dev/null | sed -n '1p')"
+CANDIDATE_VERSION="$(printf '%s
+' "$BADGING" | sed -n "s/^package: name='[^']*' versionCode='\([^']*\)'.*/\1/p")"
+[[ "$CANDIDATE_VERSION" =~ ^[0-9]+$ ]] || fail 'candidate_version_code_invalid'
 
 set +e
 NO_SECRET="$(env -i PATH="$PATH" ANDROID_HOME="$SDK_ROOT" SLIPNET_RELEASE_UNSIGNED_APK="$UNSIGNED" "$GATE" 2>&1)"
@@ -78,13 +85,13 @@ set -e
 printf '%s\n' "$MISMATCH_OUTPUT" | grep -q 'signer_mismatch=' || fail 'signer_mismatch_reason'
 [[ ! -e "$OUTPUT" ]] || fail 'signer_mismatch_output_survived'
 export SLIPNET_RELEASE_CERT_SHA256="$EXPECTED_CERT"
-export SLIPNET_BASELINE_VERSION_CODE=80
+export SLIPNET_BASELINE_VERSION_CODE="$CANDIDATE_VERSION"
 set +e
 VERSION_OUTPUT="$($GATE 2>&1)"
 VERSION_RC=$?
 set -e
 [[ $VERSION_RC -eq 2 ]] || fail "version_rc=$VERSION_RC"
-printf '%s\n' "$VERSION_OUTPUT" | grep -q 'version_not_monotonic=80<=80' || fail 'version_reason'
+printf '%s\n' "$VERSION_OUTPUT" | grep -q "version_not_monotonic=${CANDIDATE_VERSION}<=${CANDIDATE_VERSION}" || fail 'version_reason'
 [[ ! -e "$OUTPUT" ]] || fail 'version_output_survived'
 
 printf 'SLIPNET_EA_RELEASE_GATE_TEST_PASS;noSecret=PASS;positive=PASS;signerMismatch=PASS;versionMonotonic=PASS;cleanup=PASS\n'
