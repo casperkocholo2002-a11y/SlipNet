@@ -70,13 +70,14 @@ Personal EA deliberately does not recursively initialize legacy DNS/Rust submodu
 5. uploads the qualified APK as a short-retention workflow artifact;
 6. removes the decoded keystore on every exit path.
 
+The production certificate SHA-256 is deliberately public and pinned in `config/release/slipnet-ea-cert.sha256`; it is not a mutable Actions secret. This makes signer rotation require an explicit reviewed source commit.
+
 Required repository secrets:
 
 - `SLIPNET_EA_KEYSTORE_BASE64`
 - `SLIPNET_EA_KEY_ALIAS`
 - `SLIPNET_EA_STORE_PASSWORD`
 - `SLIPNET_EA_KEY_PASSWORD`
-- `SLIPNET_EA_CERT_SHA256`
 
 `CONFIG_ENCRYPTION_KEY` remains a separate build secret.
 

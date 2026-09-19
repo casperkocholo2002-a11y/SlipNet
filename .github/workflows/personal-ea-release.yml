@@ -35,6 +35,7 @@ jobs:
         with:
           java-version: "21"
           distribution: jetbrains
+          cache: gradle
 
       - name: Install Android SDK components
         run: |
@@ -67,19 +68,23 @@ jobs:
       - name: Qualify signing gate with ephemeral key
         run: tools/android/release_signing_gate_test.sh
 
+      - name: Load pinned production signer identity
+        run: |
+          cert_sha256="$(tr -d '[:space:]' < config/release/slipnet-ea-cert.sha256)"
+          test "${#cert_sha256}" -eq 64
+          printf 'SLIPNET_RELEASE_CERT_SHA256=%s\n' "$cert_sha256" >> "$GITHUB_ENV"
+
       - name: Require production signer secrets
         env:
           KEYSTORE_BASE64: ${{ secrets.SLIPNET_EA_KEYSTORE_BASE64 }}
           KEY_ALIAS: ${{ secrets.SLIPNET_EA_KEY_ALIAS }}
           STORE_PASSWORD: ${{ secrets.SLIPNET_EA_STORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.SLIPNET_EA_KEY_PASSWORD }}
-          CERT_SHA256: ${{ secrets.SLIPNET_EA_CERT_SHA256 }}
         run: |
           test -n "$KEYSTORE_BASE64"
           test -n "$KEY_ALIAS"
           test -n "$STORE_PASSWORD"
           test -n "$KEY_PASSWORD"
-          test -n "$CERT_SHA256"
 
       - name: Decode production keystore
         env:
@@ -95,7 +100,7 @@ jobs:
           SLIPNET_RELEASE_KEY_ALIAS: ${{ secrets.SLIPNET_EA_KEY_ALIAS }}
           SLIPNET_RELEASE_STORE_PASSWORD: ${{ secrets.SLIPNET_EA_STORE_PASSWORD }}
           SLIPNET_RELEASE_KEY_PASSWORD: ${{ secrets.SLIPNET_EA_KEY_PASSWORD }}
-          SLIPNET_RELEASE_CERT_SHA256: ${{ secrets.SLIPNET_EA_CERT_SHA256 }}
+          SLIPNET_RELEASE_CERT_SHA256: ${{ env.SLIPNET_RELEASE_CERT_SHA256 }}
           SLIPNET_BASELINE_VERSION_CODE: ${{ inputs.baseline_version_code }}
           SLIPNET_ROLLBACK_DATA_POLICY: ${{ inputs.rollback_data_policy }}
           SLIPNET_RELEASE_UNSIGNED_APK: ${{ env.SLIPNET_RELEASE_UNSIGNED_APK }}
