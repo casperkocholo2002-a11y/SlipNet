@@ -29,13 +29,16 @@ fun abiFromTarget(target: String): String = when {
     else -> target
 }
 
-// Signing configuration
+// Signing configuration. Normal release builds retain the legacy fail-closed
+// signing requirement. Only the explicit external-gate mode is allowed to
+// produce an unsigned release candidate for tools/android/release_signing_gate.sh.
+val externalReleaseGateBuild =
+    providers.gradleProperty("SLIPNET_EXTERNAL_RELEASE_GATE").orNull == "true"
 val keystorePropertiesFile = rootProject.file("keystore.properties")
 val keystoreProperties = Properties()
 if (keystorePropertiesFile.exists()) {
     keystoreProperties.load(keystorePropertiesFile.inputStream())
 }
-
 // Config encryption key from local.properties
 val localPropertiesFile = rootProject.file("local.properties")
 val localProperties = Properties()
@@ -146,7 +149,9 @@ android {
             isShrinkResources = true
             isMinifyEnabled = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            signingConfig = signingConfigs.getByName("release")
+            if (!externalReleaseGateBuild) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 

@@ -131,3 +131,6 @@ __pycache__/
 .env
 .env.*
 !.env.example
+
+# Local release-signing outputs (never commit)
+.local/
