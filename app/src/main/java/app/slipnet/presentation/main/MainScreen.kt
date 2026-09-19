@@ -2313,7 +2313,12 @@ private fun shareGithubLink(context: Context) {
     val intent = Intent(Intent.ACTION_SEND).apply {
         type = "text/plain"
         putExtra(Intent.EXTRA_SUBJECT, "SlipNet VPN")
-        putExtra(Intent.EXTRA_TEXT, "Download SlipNet VPN:\nhttps://github.com/anonvector/SlipNet/releases/latest")
+        val releaseUrl = if (BuildConfig.PERSONAL_BUILD) {
+            "https://github.com/casperkocholo2002-a11y/SlipNet/releases/latest"
+        } else {
+            "https://github.com/anonvector/SlipNet/releases/latest"
+        }
+        putExtra(Intent.EXTRA_TEXT, "Download SlipNet VPN:\n$releaseUrl")
     }
     context.startActivity(Intent.createChooser(intent, "Share SlipNet"))
 }

@@ -1254,6 +1254,45 @@ class VpnRepositoryImpl @Inject constructor(
         _trafficStats.value = TrafficStats.EMPTY
     }
 
+    suspend fun syncManagedSubscriptionUsage(
+        profile: ServerProfile,
+        authoritativeSent: Long,
+        authoritativeReceived: Long
+    ) {
+        if (
+            profile.tunnelType != TunnelType.VLESS ||
+            !profile.isLocked ||
+            profile.id <= 0L
+        ) {
+            return
+        }
+
+        connectedProfile = profile
+        managedUsageProfileId = profile.id
+        managedUsageTotalSent = authoritativeSent.coerceAtLeast(0L)
+        managedUsageTotalReceived = authoritativeReceived.coerceAtLeast(0L)
+
+        // The server snapshot already includes control traffic used to fetch
+        // this snapshot. Start local delta accounting from the bridge's current
+        // counters so those bytes are never double-counted in the UI.
+        managedUsageLastSessionSent = VlessBridge.getTunnelTxBytes()
+        managedUsageLastSessionReceived = VlessBridge.getTunnelRxBytes()
+
+        preferencesDataStore.setManagedProfileUsage(
+            profile.id,
+            managedUsageTotalSent,
+            managedUsageTotalReceived
+        )
+
+        prevBytesSent = managedUsageTotalSent
+        prevBytesReceived = managedUsageTotalReceived
+        prevTimestamp = System.currentTimeMillis()
+        _trafficStats.value = TrafficStats(
+            bytesSent = managedUsageTotalSent,
+            bytesReceived = managedUsageTotalReceived,
+        )
+    }
+
     private fun applyManagedSubscriptionUsage(
         sessionSent: Long,
         sessionReceived: Long

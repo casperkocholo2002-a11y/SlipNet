@@ -1565,12 +1565,48 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(payload).encode())
 
     def do_GET(self):
-        if not self.check_auth():
-            return
-
         from urllib.parse import urlparse, parse_qs
 
         parsed = urlparse(self.path)
+
+        # Device-side managed subscription usage. This endpoint remains bound
+        # to localhost and is reached through an already-authenticated VLESS
+        # tunnel. The VLESS UUID is reused as the subscription identity; no
+        # monitor/admin credential is ever shipped to the app.
+        if parsed.path == '/api/subscription/usage':
+            try:
+                token = self.headers.get('X-SlipNet-Subscription', '')
+                payload = vless_admin.subscription_usage_for_token(token)
+                body = json.dumps(payload, separators=(',', ':')).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('Content-Length', str(len(body)))
+                self.send_header('Connection', 'close')
+                self.end_headers()
+                self.wfile.write(body)
+            except PermissionError:
+                body = b'{"success":false,"error":"Forbidden"}'
+                self.send_response(403)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('Content-Length', str(len(body)))
+                self.send_header('Connection', 'close')
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                body = b'{"success":false,"error":"Unavailable"}'
+                self.send_response(503)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('Content-Length', str(len(body)))
+                self.send_header('Connection', 'close')
+                self.end_headers()
+                self.wfile.write(body)
+            return
+
+        if not self.check_auth():
+            return
 
         if parsed.path == '/api/vless/users':
             try:

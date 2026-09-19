@@ -66,6 +66,10 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import org.json.JSONObject
+import java.net.InetSocketAddress
+import java.net.Proxy
+import java.net.Socket
 import javax.inject.Inject
 
 @AndroidEntryPoint
@@ -3345,6 +3349,118 @@ class SlipNetVpnService : VpnService() {
         }
     }
 
+    private data class ManagedSubscriptionUsage(
+        val bytesSent: Long,
+        val bytesReceived: Long,
+        val totalBytes: Long,
+        val quotaBytes: Long,
+        val remainingBytes: Long,
+        val expiresAt: Long,
+        val accessState: String,
+    )
+
+    private suspend fun fetchManagedSubscriptionUsage(
+        profile: app.slipnet.domain.model.ServerProfile,
+        proxyHost: String,
+        proxyPort: Int,
+    ): Result<ManagedSubscriptionUsage> = withContext(Dispatchers.IO) {
+        if (!profile.isLocked || profile.vlessUuid.isBlank()) {
+            return@withContext Result.failure(
+                IllegalStateException("Managed subscription identity is missing")
+            )
+        }
+
+        try {
+            val proxy = Proxy(
+                Proxy.Type.SOCKS,
+                InetSocketAddress(proxyHost, proxyPort)
+            )
+            Socket(proxy).use { socket ->
+                socket.soTimeout = 10_000
+                socket.connect(InetSocketAddress("127.0.0.1", 8080), 10_000)
+
+                val request = buildString {
+                    append("GET /api/subscription/usage HTTP/1.1\r\n")
+                    append("Host: localhost\r\n")
+                    append("X-SlipNet-Subscription: ")
+                    append(profile.vlessUuid)
+                    append("\r\n")
+                    append("Accept: application/json\r\n")
+                    append("Connection: close\r\n\r\n")
+                }
+                socket.getOutputStream().write(request.toByteArray(Charsets.US_ASCII))
+                socket.getOutputStream().flush()
+
+                val input = socket.getInputStream().buffered()
+                val statusLine = buildString {
+                    while (true) {
+                        val b = input.read()
+                        if (b < 0) break
+                        if (b == '\n'.code) break
+                        if (b != '\r'.code) append(b.toChar())
+                    }
+                }
+                if (!statusLine.contains(" 200 ")) {
+                    throw IllegalStateException("Subscription authority rejected request")
+                }
+
+                var contentLength = -1
+                while (true) {
+                    val line = buildString {
+                        while (true) {
+                            val b = input.read()
+                            if (b < 0) break
+                            if (b == '\n'.code) break
+                            if (b != '\r'.code) append(b.toChar())
+                        }
+                    }
+                    if (line.isEmpty()) break
+                    val colon = line.indexOf(':')
+                    if (colon > 0 && line.substring(0, colon).trim()
+                            .equals("Content-Length", ignoreCase = true)
+                    ) {
+                        contentLength = line.substring(colon + 1).trim().toIntOrNull() ?: -1
+                    }
+                }
+
+                if (contentLength < 2 || contentLength > 16_384) {
+                    throw IllegalStateException("Invalid subscription usage response")
+                }
+                val bodyBytes = ByteArray(contentLength)
+                var offset = 0
+                while (offset < bodyBytes.size) {
+                    val n = input.read(bodyBytes, offset, bodyBytes.size - offset)
+                    if (n <= 0) throw IllegalStateException("Truncated subscription usage response")
+                    offset += n
+                }
+                val json = JSONObject(String(bodyBytes, Charsets.UTF_8))
+                if (!json.optBoolean("success", false)) {
+                    throw IllegalStateException("Subscription usage unavailable")
+                }
+                val usage = ManagedSubscriptionUsage(
+                    bytesSent = json.optLong("bytes_sent", 0L).coerceAtLeast(0L),
+                    bytesReceived = json.optLong("bytes_received", 0L).coerceAtLeast(0L),
+                    totalBytes = json.optLong("total_bytes", 0L).coerceAtLeast(0L),
+                    quotaBytes = json.optLong("quota_bytes", 0L).coerceAtLeast(0L),
+                    remainingBytes = json.optLong("remaining_bytes", 0L).coerceAtLeast(0L),
+                    expiresAt = json.optLong("expires_at", 0L).coerceAtLeast(0L),
+                    accessState = json.optString("access_state", "active"),
+                )
+                if (usage.accessState != "active") {
+                    throw IllegalStateException("Subscription is " + usage.accessState)
+                }
+                Log.operational(
+                    "SUBSCRIPTION_USAGE_SYNC_OK",
+                    "total" to usage.totalBytes,
+                )
+                Result.success(usage)
+            }
+        } catch (error: Exception) {
+            Log.operational("SUBSCRIPTION_USAGE_SYNC_FAILED")
+            Result.failure(error)
+        }
+    }
+
     private suspend fun connectVless(profile: app.slipnet.domain.model.ServerProfile, dnsServer: String) {
         val proxyPort = preferencesDataStore.proxyListenPort.first()
         val proxyHost = preferencesDataStore.proxyListenAddress.first()
@@ -3428,10 +3544,17 @@ class SlipNetVpnService : VpnService() {
                 return
             }
 
+            var managedUsage: ManagedSubscriptionUsage? = null
             if (BuildConfig.PERSONAL_BUILD) {
-                val authProbe = withContext(Dispatchers.IO) { VlessBridge.probeAuthenticated() }
-                if (authProbe.isFailure) {
-                    val reason = authProbe.exceptionOrNull()?.message ?: "VLESS authentication failed"
+                val authResult = if (profile.isLocked) {
+                    fetchManagedSubscriptionUsage(profile, proxyHost, proxyPort)
+                        .also { result -> managedUsage = result.getOrNull() }
+                        .map { Unit }
+                } else {
+                    withContext(Dispatchers.IO) { VlessBridge.probeAuthenticated() }
+                }
+                if (authResult.isFailure) {
+                    val reason = authResult.exceptionOrNull()?.message ?: "VLESS authentication failed"
                     if (failClosedPersonalVless(reason, PersonalVlessAuthorityFact.STRUCTURAL_FAILURE)) return
                     connectionManager.onVpnError("VLESS authentication failed: $reason")
                     VlessBridge.stop()
@@ -3443,6 +3566,9 @@ class SlipNetVpnService : VpnService() {
 
             observePersonalVless(PersonalVlessAuthorityFact.STRUCTURAL_SUCCESS, "websocket + VLESS auth")
             vpnRepository.setProxyConnected(profile)
+            managedUsage?.let {
+                vpnRepository.syncManagedSubscriptionUsage(profile, it.bytesSent, it.bytesReceived)
+            }
             observePersonalVless(PersonalVlessAuthorityFact.TERMINAL_SUCCESS, "personal VLESS proxy connected")
             app.slipnet.util.AppLog.operational("VPN_INDICATOR_CONNECTED", "proxy_only" to 1L)
             releasePersonalVlessSteadyStateLocks()
@@ -3527,10 +3653,17 @@ class SlipNetVpnService : VpnService() {
             return
         }
 
+        var managedUsage: ManagedSubscriptionUsage? = null
         if (BuildConfig.PERSONAL_BUILD) {
-            val authProbe = withContext(Dispatchers.IO) { VlessBridge.probeAuthenticated() }
-            if (authProbe.isFailure) {
-                val reason = authProbe.exceptionOrNull()?.message ?: "VLESS authentication failed"
+            val authResult = if (profile.isLocked) {
+                fetchManagedSubscriptionUsage(profile, proxyHost, proxyPort)
+                    .also { result -> managedUsage = result.getOrNull() }
+                    .map { Unit }
+            } else {
+                withContext(Dispatchers.IO) { VlessBridge.probeAuthenticated() }
+            }
+            if (authResult.isFailure) {
+                val reason = authResult.exceptionOrNull()?.message ?: "VLESS authentication failed"
                 if (failClosedPersonalVless(reason, PersonalVlessAuthorityFact.STRUCTURAL_FAILURE)) return
                 connectionManager.onVpnError("VLESS authentication failed: $reason")
                 VlessBridge.stop()
@@ -3556,6 +3689,10 @@ class SlipNetVpnService : VpnService() {
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return
+        }
+
+        managedUsage?.let {
+            vpnRepository.syncManagedSubscriptionUsage(profile, it.bytesSent, it.bytesReceived)
         }
 
         observePersonalVless(PersonalVlessAuthorityFact.TERMINAL_SUCCESS, "personal VLESS tunnel connected")

@@ -124,7 +124,7 @@ android {
             buildConfigField("boolean", "INCLUDE_DNSTT", "false")
             buildConfigField("boolean", "INCLUDE_VAYDNS", "false")
             buildConfigField("boolean", "INCLUDE_SLIPSTREAM", "false")
-            buildConfigField("String", "UPDATE_API_URL", "\"\"")
+            buildConfigField("String", "UPDATE_API_URL", "\"https://api.github.com/repos/casperkocholo2002-a11y/SlipNet/releases/latest\"")
         }
         create("dnsLab") {
             dimension = "edition"

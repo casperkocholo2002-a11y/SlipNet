@@ -2032,6 +2032,47 @@ def list_users_with_activity():
     return users
 
 
+def subscription_usage_for_token(token):
+    import hmac
+
+    token = str(token or "").strip().lower()
+    if len(token) != 36:
+        raise PermissionError("Invalid subscription token")
+
+    matched_name = None
+    for client in _clients(_load()):
+        client_id = str(client.get("id") or "").strip().lower()
+        if client_id and hmac.compare_digest(client_id, token):
+            matched_name = str(client.get("email") or "").strip()
+            break
+
+    if not matched_name:
+        raise PermissionError("Invalid subscription token")
+
+    user = next(
+        (
+            item for item in list_users()
+            if str(item.get("name") or "").lower() == matched_name.lower()
+        ),
+        None,
+    )
+    if user is None:
+        raise RuntimeError("Subscription usage is unavailable")
+
+    return {
+        "success": True,
+        "bytes_sent": int(user.get("uplink", 0) or 0),
+        "bytes_received": int(user.get("downlink", 0) or 0),
+        "total_bytes": int(user.get("total", 0) or 0),
+        "quota_bytes": int(user.get("quota_bytes", 0) or 0),
+        "remaining_bytes": int(user.get("remaining_bytes", 0) or 0),
+        "created_at": int(user.get("created_at", 0) or 0),
+        "expires_at": int(user.get("expires_at", 0) or 0),
+        "days_left": user.get("days_left"),
+        "access_state": str(user.get("access_state") or "active"),
+    }
+
+
 def config_payload(name):
     _, client = _get_client(name)
     actual = client.get("email") or _validate_name(name)
