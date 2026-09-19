@@ -400,18 +400,31 @@ def get_all_data():
         if not user.get("duration") and online:
             user["duration"] = tunnel.get("duration")
 
+    vless_users_degraded = False
+    vless_users_error = ""
     try:
         vless_users = vless_admin.list_users_with_activity()
-    except Exception:
+    except Exception as activity_error:
+        vless_users_degraded = True
+        vless_users_error = (
+            "Recent activity unavailable: "
+            + str(activity_error)[:160]
+        )
         try:
             vless_users = vless_admin.list_users()
             for vless in vless_users:
                 vless.setdefault("activity", [])
                 vless.setdefault("current_services", [])
                 vless.setdefault("last_destination", None)
-        except Exception:
+        except Exception as users_error:
             vless_users = []
+            vless_users_error = (
+                "VLESS user data unavailable: "
+                + str(users_error)[:160]
+            )
     data["vless_users"] = vless_users
+    data["vless_users_degraded"] = vless_users_degraded
+    data["vless_users_error"] = vless_users_error
     for vless in vless_users:
         raw_name = vless["name"]
         key = _user_key(data["users"], raw_name)
@@ -991,14 +1004,27 @@ function fmtTotal(bytes) {
 
 async function refresh() {
   try {
-    const r = await fetch('/api/data');
+    const r = await fetch('/api/data', {cache:'no-store'});
+    if (!r.ok) {
+      throw new Error('HTTP ' + r.status);
+    }
     data = await r.json();
     renderStats();
     renderUsers();
+    if (typeof renderVlessUsersFromData === 'function') {
+      renderVlessUsersFromData(
+        data.vless_users || [],
+        Boolean(data.vless_users_degraded),
+        data.vless_users_error || ''
+      );
+    }
     if (selected && data.users[selected]) renderMain(selected);
     document.getElementById('last-update').textContent = 'Updated: '+data.timestamp;
   } catch(e) {
     document.getElementById('last-update').textContent = 'Connection error';
+    if (typeof renderVlessUsersFromData === 'function') {
+      renderVlessUsersFromData([], true, 'Monitor data request failed');
+    }
   }
 }
 
@@ -1167,66 +1193,7 @@ function vlessEsc(text) {
 }
 
 async function loadVlessUsers() {
-  try {
-    const r = await fetch('/api/vless/users', {cache:'no-store'});
-
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-
-    const payload = await r.json();
-    const users = payload.users || [];
-    const el = document.getElementById('vless-admin-list');
-
-    if (!el) return;
-
-    if (!users.length) {
-      el.innerHTML = '<div class="vless-loading">No VLESS users</div>';
-      return;
-    }
-
-    el.innerHTML = users.map(u => `
-      <div class="vless-user-row">
-        <div>
-          <div class="vless-user-name">
-            <span class="vless-dot ${u.online ? 'online' : ''}"></span>
-            ${vlessEsc(u.name)}
-          </div>
-          <div class="vless-user-state">
-            ${u.access_state === 'active' ? (u.online ? 'Online' : 'Offline') : ('Blocked · ' + vlessEsc(u.access_state))}
-            ${u.last_activity ? ' · ' + vlessEsc(u.last_activity) : ''}
-            · Enrollment: ${vlessEsc(u.enrollment_state || 'legacy')}${u.device_bound ? ' · Device bound' : ''}
-          </div>
-        </div>
-
-        <div class="vless-traffic">
-          <span class="vless-total">${vlessEsc(u.total_f)}</span><br><span class="vless-usage-label">Usage since subscription baseline</span><br>
-          ↑ ${vlessEsc(u.uplink_f)} &nbsp; ↓ ${vlessEsc(u.downlink_f)}<br>
-          <span class="vless-usage-label">Quota: ${vlessEsc(u.quota_f || 'Unlimited')} · Remaining: ${vlessEsc(u.remaining_f || 'Unlimited')} · Days: ${u.days_left == null ? 'Unlimited' : vlessEsc(u.days_left)}</span>
-        </div>
-
-        <div class="vless-actions">
-          <button class="vless-action-btn"
-                  onclick="copyVlessConfig('${vlessEsc(u.name)}')">Copy One-Time</button>
-          <button class="vless-action-btn"
-                  onclick="showVlessQr('${vlessEsc(u.name)}')">QR</button>
-          <button class="vless-action-btn"
-                  onclick="downloadVlessConfig('${vlessEsc(u.name)}')">Download One-Time</button>
-          <button class="vless-action-btn"
-                  onclick="editVlessLimits('${vlessEsc(u.name)}')">Limits</button>
-          <button class="vless-action-btn"
-                  onclick="resetVlessUsage('${vlessEsc(u.name)}')">Reset Usage</button>
-          <button class="vless-action-btn"
-                  onclick="reissueVlessEnrollment('${vlessEsc(u.name)}')">Reset Device</button>
-          <button class="vless-action-btn vless-delete-btn"
-                  onclick="deleteVlessUser('${vlessEsc(u.name)}')">
-            Delete
-          </button>
-        </div>
-      </div>
-    `).join('');
-
-  } catch (e) {
-    vlessMsg('VLESS API error: ' + e.message);
-  }
+  await refresh();
 }
 
 async function addVlessUser() {
@@ -1278,7 +1245,7 @@ async function editVlessLimits(name) {
   });
   const result = await r.json();
   if (!r.ok || !result.success) { vlessMsg('Limit update failed: '+(result.error||'unknown error')); return; }
-  vlessMsg('Limits updated for '+name+'. Rotate password to issue an artifact with the new client-visible expiry.');
+  vlessMsg('Limits updated for '+name+'. Use Reset Device if you need a new one-time file with the updated expiry.');
   await loadVlessUsers();
 }
 
@@ -1297,7 +1264,7 @@ async function resetVlessUsage(name) {
 
 async function reissueVlessEnrollment(name) {
   if (!confirm(
-    'Reset device for ' + name + '?\n\n' +
+    'Reset device for ' + name + '?\\n\\n' +
     'The previous VLESS credential will be revoked immediately and a new one-time file will be issued.'
   )) return;
   const r = await fetch('/api/vless/reissue', {
@@ -1390,8 +1357,6 @@ async function downloadVlessConfig(name) {
   vlessMsg('Downloading one-time EA enrollment for ' + name);
 }
 
-window.__vlessLegacyTimeout = setTimeout(loadVlessUsers, 200);
-window.__vlessLegacyTimer = setInterval(loadVlessUsers, 3000);
 </script>
 
 
@@ -1416,19 +1381,8 @@ function activityChip(a) {
   `;
 }
 
-async function loadVlessUsers() {
+function renderVlessUsersFromData(users, degraded=false, error='') {
   try {
-    const r = await fetch(
-      '/api/data',
-      {cache:'no-store', credentials:'same-origin'}
-    );
-
-    if (!r.ok)
-      throw new Error('HTTP ' + r.status);
-
-    const payload = await r.json();
-    const users = payload.vless_users || [];
-
     const el =
       document.getElementById('vless-admin-list');
 
@@ -1436,12 +1390,19 @@ async function loadVlessUsers() {
       return;
 
     if (!users.length) {
-      el.innerHTML =
-        '<div class="vless-loading">No VLESS users</div>';
+      el.innerHTML = error
+        ? '<div class="vless-loading">' + vlessEsc(error) + '</div>'
+        : '<div class="vless-loading">No VLESS users</div>';
       return;
     }
 
-    el.innerHTML = users.map(u => {
+    const statusBanner = degraded
+      ? '<div class="vless-loading">' +
+          vlessEsc(error || 'Recent activity unavailable') +
+        '</div>'
+      : '';
+
+    el.innerHTML = statusBanner + users.map(u => {
 
       const activity =
         (u.activity || []).slice(0, 4);
@@ -1464,6 +1425,45 @@ async function loadVlessUsers() {
           '<div class="app-empty">No recent activity</div>';
       }
 
+      const enrollmentState = u.enrollment_state || 'legacy';
+      const canDeliverOneTime =
+        enrollmentState === 'unused' &&
+        u.access_state === 'active';
+
+      const deliveryActions = canDeliverOneTime
+        ? `
+            <button class="vless-action-btn"
+              onclick="copyVlessConfig('${vlessEsc(u.name)}')">Copy One-Time</button>
+            <button class="vless-action-btn"
+              onclick="showVlessQr('${vlessEsc(u.name)}')">QR</button>
+            <button class="vless-action-btn"
+              onclick="downloadVlessConfig('${vlessEsc(u.name)}')">Download One-Time</button>
+          `
+        : `
+            <span class="vless-usage-label">
+              ${enrollmentState === 'legacy'
+                ? 'Reset Device to issue one-time file'
+                : enrollmentState === 'pending'
+                  ? 'Activation pending on first device'
+                  : enrollmentState === 'redeemed'
+                    ? 'One-time file already used'
+                    : 'One-time delivery unavailable'}
+            </span>
+          `;
+
+      const resetDeviceAction =
+        u.access_state === 'active'
+          ? `
+              <button class="vless-action-btn"
+                onclick="reissueVlessEnrollment('${vlessEsc(u.name)}')">Reset Device</button>
+            `
+          : `
+              <button class="vless-action-btn" disabled
+                title="Activate the subscription before resetting the device">
+                Reset Device
+              </button>
+            `;
+
       return `
         <div class="vless-user-row">
 
@@ -1478,7 +1478,7 @@ async function loadVlessUsers() {
                 ? (u.online ? 'Online' : 'Offline')
                 : ('Blocked · ' + vlessEsc(u.access_state))}
               ${u.last_activity ? ' · ' + vlessEsc(u.last_activity) : ''}
-              · Enrollment: ${vlessEsc(u.enrollment_state || 'legacy')}
+              · Enrollment: ${vlessEsc(enrollmentState)}
               ${u.device_bound ? ' · Device bound' : ''}
             </div>
           </div>
@@ -1502,18 +1502,12 @@ async function loadVlessUsers() {
           </div>
 
           <div class="vless-actions">
-            <button class="vless-action-btn"
-              onclick="copyVlessConfig('${vlessEsc(u.name)}')">Copy One-Time</button>
-            <button class="vless-action-btn"
-              onclick="showVlessQr('${vlessEsc(u.name)}')">QR</button>
-            <button class="vless-action-btn"
-              onclick="downloadVlessConfig('${vlessEsc(u.name)}')">Download One-Time</button>
+            ${deliveryActions}
             <button class="vless-action-btn"
               onclick="editVlessLimits('${vlessEsc(u.name)}')">Limits</button>
             <button class="vless-action-btn"
               onclick="resetVlessUsage('${vlessEsc(u.name)}')">Reset Usage</button>
-            <button class="vless-action-btn"
-              onclick="reissueVlessEnrollment('${vlessEsc(u.name)}')">Reset Device</button>
+            ${resetDeviceAction}
             <button class="vless-action-btn vless-delete-btn"
               onclick="deleteVlessUser('${vlessEsc(u.name)}')">Delete</button>
           </div>
@@ -1526,35 +1520,18 @@ async function loadVlessUsers() {
     const el = document.getElementById('vless-admin-list');
     if (el) {
       el.innerHTML =
-        '<div class="vless-loading">VLESS user list temporarily unavailable · retrying...</div>';
+        '<div class="vless-loading">VLESS user list render error</div>';
     }
     vlessMsg(
-      'VLESS API error: ' + e.message
+      'VLESS render error: ' + e.message
     );
   }
 }
 
 
-/* VLESS_ACTIVITY_REFRESH_OWNER_V3 */
-
-if (window.__vlessLegacyTimeout) {
-  clearTimeout(window.__vlessLegacyTimeout);
-  window.__vlessLegacyTimeout = null;
-}
-
-if (window.__vlessLegacyTimer) {
-  clearInterval(window.__vlessLegacyTimer);
-  window.__vlessLegacyTimer = null;
-}
-
-if (window.__vlessActivityTimer) {
-  clearInterval(window.__vlessActivityTimer);
-}
+/* VLESS_ACTIVITY_REFRESH_OWNER_V4 */
 
 loadVlessUsers();
-
-window.__vlessActivityTimer =
-  setInterval(loadVlessUsers, 3000);
 
 </script>
 
@@ -1569,20 +1546,31 @@ class Handler(BaseHTTPRequestHandler):
         auth = self.headers.get('Authorization', '')
         expected = 'Basic ' + base64.b64encode(f'admin:{PASSWORD}'.encode()).decode()
         if auth != expected:
+            body = b'Unauthorized'
             self.send_response(401)
             self.send_header('WWW-Authenticate', 'Basic realm="SlipNet Monitor"')
             self.send_header('Content-Type', 'text/plain')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Connection', 'close')
             self.end_headers()
-            self.wfile.write(b'Unauthorized')
+            self.wfile.write(body)
+            self.close_connection = True
             return False
         return True
 
     def send_json(self, payload, status=200):
+        body = json.dumps(
+            payload,
+            separators=(',', ':'),
+        ).encode()
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Cache-Control', 'no-store')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Connection', 'close')
         self.end_headers()
-        self.wfile.write(json.dumps(payload).encode())
+        self.wfile.write(body)
+        self.close_connection = True
 
     def do_GET(self):
         from urllib.parse import urlparse, parse_qs
@@ -1709,7 +1697,13 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == '/api/data':
-            self.send_json(get_all_data())
+            try:
+                self.send_json(get_all_data())
+            except Exception:
+                self.send_json({
+                    "success": False,
+                    "error": "Monitor data unavailable",
+                }, 500)
             return
 
         self.send_response(200)
@@ -1723,7 +1717,11 @@ class Handler(BaseHTTPRequestHandler):
 
         parsed = urlparse(self.path)
 
-        if parsed.path in ('/api/enrollment/challenge', '/api/enrollment/redeem'):
+        if parsed.path in (
+            '/api/enrollment/challenge',
+            '/api/enrollment/redeem',
+            '/api/enrollment/complete',
+        ):
             try:
                 length = int(self.headers.get('Content-Length', '0') or 0)
                 if length < 1 or length > 8192:
@@ -1737,8 +1735,16 @@ class Handler(BaseHTTPRequestHandler):
                         payload.get("device_id", ""),
                         payload.get("public_key", ""),
                     )
-                else:
+                elif parsed.path == '/api/enrollment/redeem':
                     result = vless_admin.redeem_enrollment(
+                        payload.get("token", ""),
+                        payload.get("device_id", ""),
+                        payload.get("public_key", ""),
+                        payload.get("challenge", ""),
+                        payload.get("signature", ""),
+                    )
+                else:
+                    result = vless_admin.complete_enrollment(
                         payload.get("token", ""),
                         payload.get("device_id", ""),
                         payload.get("public_key", ""),
@@ -1764,7 +1770,6 @@ class Handler(BaseHTTPRequestHandler):
             '/api/vless/delete',
             '/api/vless/limits',
             '/api/vless/reset-usage',
-            '/api/vless/password',
             '/api/vless/reissue',
         ):
 
@@ -1806,10 +1811,7 @@ class Handler(BaseHTTPRequestHandler):
                 elif parsed.path == '/api/vless/reissue':
                     result = vless_admin.reissue_enrollment(username)
                 else:
-                    result = vless_admin.rotate_delivery_password(
-                        username,
-                        payload.get("password", ""),
-                    )
+                    raise RuntimeError("Unsupported VLESS admin operation")
 
                 self.send_json(result)
 

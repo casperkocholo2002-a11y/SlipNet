@@ -22,23 +22,28 @@ import javax.inject.Singleton
 import javax.net.ssl.HttpsURLConnection
 
 data class EnrollmentDescriptor(
+    val version: Int,
     val name: String,
     val endpoint: String,
     val backupEndpoint: String?,
     val token: String,
 ) {
+    val requiresCompletion: Boolean
+        get() = version >= 2
+
     val endpoints: List<String>
         get() = listOfNotNull(endpoint, backupEndpoint).distinct()
 }
 
 @Singleton
 class EnrollmentManager @Inject constructor(
-    @ApplicationContext private val context: Context,
+    @param:ApplicationContext private val context: Context,
 ) {
     companion object {
         const val SCHEME = "slipnet-enroll://"
         private const val KEY_ALIAS = "slipnet_enrollment_device_v1"
-        private const val CLAIM_VERSION = "slipnet-enroll-challenge-v1"
+        private const val REDEEM_CLAIM_VERSION = "slipnet-enroll-challenge-v1"
+        private const val COMPLETE_CLAIM_VERSION = "slipnet-enroll-complete-v1"
         private const val MAX_RESPONSE_BYTES = 64 * 1024
     }
 
@@ -77,13 +82,46 @@ class EnrollmentManager @Inject constructor(
         }
     }
 
-    private fun redeemWithEndpoint(
+    suspend fun complete(input: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            val descriptor = parseDescriptor(input)
+            if (!descriptor.requiresCompletion) {
+                return@runCatching
+            }
+            val deviceId = DeviceIdUtil.getScrambledDeviceId(context)
+            require(deviceId.matches(Regex("[0-9a-f]{16}"))) { "Device identity is unavailable" }
+
+            val keyPair = getOrCreateDeviceKeyPair()
+            val publicKey = Base64.encodeToString(keyPair.public.encoded, Base64.NO_WRAP)
+            var lastError: Exception? = null
+
+            for (endpoint in descriptor.endpoints) {
+                try {
+                    completeWithEndpoint(
+                        descriptor = descriptor,
+                        endpoint = endpoint,
+                        deviceId = deviceId,
+                        keyPair = keyPair,
+                        publicKey = publicKey,
+                    )
+                    return@runCatching
+                } catch (error: Exception) {
+                    lastError = error
+                }
+            }
+
+            throw lastError ?: IllegalStateException("Enrollment completion failed")
+        }
+    }
+
+    private fun signedProofPayload(
         descriptor: EnrollmentDescriptor,
         endpoint: String,
         deviceId: String,
         keyPair: KeyPair,
         publicKey: String,
-    ): String {
+        claimVersion: String,
+    ): JSONObject {
         val challengeEndpoint = endpoint.removeSuffix("/redeem") + "/challenge"
         val challengeJson = postJson(
             challengeEndpoint,
@@ -97,7 +135,7 @@ class EnrollmentManager @Inject constructor(
         require(challenge.length in 32..256) { "Invalid enrollment challenge" }
 
         val claim = listOf(
-            CLAIM_VERSION,
+            claimVersion,
             descriptor.token,
             deviceId,
             challenge,
@@ -109,13 +147,30 @@ class EnrollmentManager @Inject constructor(
             sign()
         }
 
-        val redeemPayload = JSONObject().apply {
+        return JSONObject().apply {
             put("token", descriptor.token)
             put("device_id", deviceId)
             put("public_key", publicKey)
             put("challenge", challenge)
             put("signature", Base64.encodeToString(signature, Base64.NO_WRAP))
         }
+    }
+
+    private fun redeemWithEndpoint(
+        descriptor: EnrollmentDescriptor,
+        endpoint: String,
+        deviceId: String,
+        keyPair: KeyPair,
+        publicKey: String,
+    ): String {
+        val redeemPayload = signedProofPayload(
+            descriptor = descriptor,
+            endpoint = endpoint,
+            deviceId = deviceId,
+            keyPair = keyPair,
+            publicKey = publicKey,
+            claimVersion = REDEEM_CLAIM_VERSION,
+        )
 
         var lastRedeemError: Exception? = null
         val redeemEndpoints = listOf(endpoint) + descriptor.endpoints.filterNot { it == endpoint }
@@ -132,6 +187,42 @@ class EnrollmentManager @Inject constructor(
             }
         }
         throw lastRedeemError ?: IllegalStateException("Enrollment redeem failed")
+    }
+
+    private fun completeWithEndpoint(
+        descriptor: EnrollmentDescriptor,
+        endpoint: String,
+        deviceId: String,
+        keyPair: KeyPair,
+        publicKey: String,
+    ) {
+        val completionPayload = signedProofPayload(
+            descriptor = descriptor,
+            endpoint = endpoint,
+            deviceId = deviceId,
+            keyPair = keyPair,
+            publicKey = publicKey,
+            claimVersion = COMPLETE_CLAIM_VERSION,
+        )
+
+        var lastCompleteError: Exception? = null
+        val completeEndpoints = (
+            listOf(endpoint) + descriptor.endpoints.filterNot { it == endpoint }
+        ).map { it.removeSuffix("/redeem") + "/complete" }.distinct()
+
+        for (completeEndpoint in completeEndpoints) {
+            try {
+                val completeJson = postJson(completeEndpoint, completionPayload)
+                require(completeJson.optString("enrollment_state") == "redeemed") {
+                    "Enrollment completion was not acknowledged"
+                }
+                return
+            } catch (error: Exception) {
+                lastCompleteError = error
+            }
+        }
+
+        throw lastCompleteError ?: IllegalStateException("Enrollment completion failed")
     }
 
     private fun postJson(endpoint: String, payload: JSONObject): JSONObject {
@@ -190,7 +281,8 @@ class EnrollmentManager @Inject constructor(
             Charsets.UTF_8,
         )
         val json = JSONObject(decoded)
-        require(json.optInt("v") == 1) { "Unsupported enrollment version" }
+        val version = json.optInt("v")
+        require(version in 1..2) { "Unsupported enrollment version" }
         val endpoint = json.getString("url").trim()
         val backupEndpoint = json.optString("backup_url").trim().takeIf { it.isNotEmpty() }
         val trustedSuffixes = BuildConfig.ENROLLMENT_TRUSTED_WORKER_SUFFIXES
@@ -213,6 +305,7 @@ class EnrollmentManager @Inject constructor(
         require(token.length in 32..256) { "Invalid enrollment token" }
         val name = json.optString("name").trim().take(64)
         return EnrollmentDescriptor(
+            version = version,
             name = name,
             endpoint = endpoint,
             backupEndpoint = backupEndpoint,
@@ -227,13 +320,21 @@ class EnrollmentManager @Inject constructor(
             return@runCatching false
         }
         if (uri.port != -1 && uri.port != 443) return@runCatching false
-        if (uri.path != "/api/enrollment/redeem" && uri.path != "/api/enrollment/challenge") {
+        if (
+            uri.path != "/api/enrollment/redeem" &&
+            uri.path != "/api/enrollment/challenge" &&
+            uri.path != "/api/enrollment/complete"
+        ) {
             return@runCatching false
         }
 
         val host = uri.host?.trim()?.lowercase() ?: return@runCatching false
         val pinned = BuildConfig.ENROLLMENT_API_URL.trim()
-        if (endpoint == pinned || endpoint == pinned.removeSuffix("/redeem") + "/challenge") {
+        if (
+            endpoint == pinned ||
+            endpoint == pinned.removeSuffix("/redeem") + "/challenge" ||
+            endpoint == pinned.removeSuffix("/redeem") + "/complete"
+        ) {
             return@runCatching true
         }
 

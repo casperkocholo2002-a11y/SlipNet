@@ -47,7 +47,8 @@ const ORIGIN_HOST = __ORIGIN_HOST__;
 const ENROLLMENT_ORIGIN_HOST = __ENROLLMENT_ORIGIN_HOST__;
 const ENROLLMENT_PATHS = new Set([
   "/api/enrollment/challenge",
-  "/api/enrollment/redeem"
+  "/api/enrollment/redeem",
+  "/api/enrollment/complete"
 ]);
 
 export default {
@@ -580,20 +581,27 @@ def backup_host(user):
 
 def refresh_pair(user, ws_path):
     key = (user or "").lower()
+
+    primary_item = _read_map(PRIMARY["map_file"]).get(key)
+    backup_item = _read_map(BACKUP["map_file"]).get(key)
+
+    if not primary_item or not backup_item:
+        raise RuntimeError(
+            f"Primary/backup Worker mapping is incomplete for {user}"
+        )
+
     refreshed = {}
-
-    for label, spec in (("primary", PRIMARY), ("backup", BACKUP)):
-        item = _read_map(spec["map_file"]).get(key)
-        if not item:
-            continue
-
+    for label, spec, item in (
+        ("primary", PRIMARY, primary_item),
+        ("backup", BACKUP, backup_item),
+    ):
         _upload_worker(spec, item["worker"])
         _ws_test(item["hostname"], ws_path)
         refreshed[label] = item["hostname"]
 
-    if not refreshed:
+    if set(refreshed) != {"primary", "backup"}:
         raise RuntimeError(
-            f"No Worker mapping exists for {user}"
+            f"Primary/backup Worker refresh is incomplete for {user}"
         )
 
     return refreshed

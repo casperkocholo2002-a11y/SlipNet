@@ -1834,9 +1834,19 @@ def _v30_plain_managed_bundle(name, lock_hash, expiration_ms, bound_device_id=""
     p = _align_v29_uri(actual, primary, "Primary", _vwa.PRIMARY)
     b = _align_v29_uri(actual, backup, "Backup", _vwa.BACKUP)
     return (
-        _v30_lock_inner_uri(p, lock_hash, expiration_ms)
+        _v30_lock_inner_uri(
+            p,
+            lock_hash,
+            expiration_ms,
+            bound_device_id=bound_device_id,
+        )
         + "\n"
-        + _v30_lock_inner_uri(b, lock_hash, expiration_ms)
+        + _v30_lock_inner_uri(
+            b,
+            lock_hash,
+            expiration_ms,
+            bound_device_id=bound_device_id,
+        )
         + "\n"
     )
 
@@ -2108,28 +2118,9 @@ def profile_artifact(name):
 
 
 def rotate_delivery_password(name, delivery_password):
-    _, client = _get_client(name)
-    actual = client.get("email") or name
-    if not delivery_password or len(delivery_password) < 6:
-        raise ValueError("Delivery password must be at least 6 characters")
-    meta = _v30_registry_item(actual)
-    lock_hash = meta.get("profile_lock_hash")
-    if not lock_hash:
-        lock_hash = _v30_password_hash(_align_secrets.token_urlsafe(32))
-    expires_at = int(meta.get("expires_at", 0) or 0)
-    encrypted, artifact = _v30_write_encrypted_artifact(
-        actual,
-        delivery_password,
-        lock_hash,
-        expires_at * 1000 if expires_at else 0,
+    raise RuntimeError(
+        "Legacy delivery-password artifacts are disabled; use Reset Device to issue a one-time enrollment file"
     )
-    _v30_registry_update(actual, {
-        "delivery_password_hash": _v30_password_hash(delivery_password),
-        "profile_lock_hash": lock_hash,
-        "artifact": artifact.name,
-        "managed_profile": True,
-    })
-    return {"success": True, "name": actual, "filename": artifact.name}
 
 
 def update_user_limits(name, duration_days=None, quota_bytes=None, reset_usage=False):
@@ -2170,10 +2161,9 @@ def update_user_limits(name, duration_days=None, quota_bytes=None, reset_usage=F
             "Limits were updated but Xray runtime access could not be re-enabled"
         )
 
-    # Keep client-visible expiry in the encrypted artifact. Rotating limits does
-    # not decrypt/re-encrypt because the server intentionally does not retain
-    # the customer's delivery password. The runtime/server expiry remains
-    # authoritative; use rotate_delivery_password() when issuing a new artifact.
+    # Runtime/server limits are authoritative. Existing redeemed profiles
+    # continue to use server authority. If a fresh client-visible artifact is
+    # needed, Reset Device rotates the credential and issues a new one-time file.
     return {
         "success": True,
         "name": actual,
@@ -2204,7 +2194,8 @@ def reset_user_usage(name):
 
 
 # ============================================================
-# SLIPNET_EA_ONE_TIME_ENROLLMENT_V1
+# SLIPNET_EA_ONE_TIME_ENROLLMENT
+# v1: legacy two-phase redeem; v2: challenge -> redeem -> complete.
 # One-time delivery token + Android Keystore public-key binding.
 # ============================================================
 
@@ -2225,6 +2216,8 @@ _V31_ENROLLMENT_TTL_SECONDS = int(
 _V31_CHALLENGE_TTL_SECONDS = int(
     os.environ.get("SLIPNET_ENROLLMENT_CHALLENGE_TTL_SECONDS", "300")
 )
+_V31_ENROLLMENT_PROTOCOL_VERSION = 2
+_V31_REISSUE_LOCK = threading.Lock()
 
 _v31_base_add_user = add_user
 _v31_base_delete_user = delete_user
@@ -2262,10 +2255,16 @@ def _v31_enrollment_urls(name):
     return urls
 
 
-def _v31_enrollment_uri(name, token):
+def _v31_enrollment_uri(
+    name,
+    token,
+    protocol_version=_V31_ENROLLMENT_PROTOCOL_VERSION,
+):
+    if protocol_version not in (1, 2):
+        raise ValueError("Unsupported enrollment protocol version")
     urls = _v31_enrollment_urls(name)
     body = {
-        "v": 1,
+        "v": protocol_version,
         "name": name,
         "url": urls[0],
         "token": token,
@@ -2308,16 +2307,23 @@ def _v31_issue_enrollment(name, refresh_workers=True):
         _vwa.refresh_pair(actual, _vwa_ws_path())
     token = _align_secrets.token_urlsafe(32)
     now = int(time.time())
-    uri = _v31_enrollment_uri(actual, token)
+    protocol_version = _V31_ENROLLMENT_PROTOCOL_VERSION
+    uri = _v31_enrollment_uri(
+        actual,
+        token,
+        protocol_version=protocol_version,
+    )
     artifact = _v31_write_enrollment_artifact(actual, uri)
     _v30_registry_update(actual, {
         "artifact": artifact.name,
         "managed_profile": True,
         "delivery_password_hash": "",
+        "enrollment_protocol_version": protocol_version,
         "enrollment_state": "unused",
         "enrollment_token_hash": _v31_token_hash(token),
         "enrollment_created_at": now,
         "enrollment_expires_at": now + _V31_ENROLLMENT_TTL_SECONDS,
+        "enrollment_bundle_issued_at": 0,
         "enrollment_redeemed_at": 0,
         "bound_device_id": "",
         "bound_device_key_sha256": "",
@@ -2331,7 +2337,7 @@ def _v31_issue_enrollment(name, refresh_workers=True):
         "bundle": uri,
         "filename": artifact.name,
         "profile_count": 2,
-        "version": 1,
+        "version": protocol_version,
         "one_time_enrollment": True,
         "enrollment_state": "unused",
         "enrollment_expires_at": now + _V31_ENROLLMENT_TTL_SECONDS,
@@ -2369,6 +2375,17 @@ def _v31_find_enrollment(reg, digest):
     raise PermissionError("Invalid enrollment token")
 
 
+def _v31_protocol_version(item):
+    raw = item.get("enrollment_protocol_version", 1)
+    try:
+        version = int(raw)
+    except Exception:
+        raise PermissionError("Invalid enrollment protocol version")
+    if version not in (1, 2):
+        raise PermissionError("Unsupported enrollment protocol version")
+    return version
+
+
 def _v31_validate_enrollment_window(item, now):
     subscription_expires = int(item.get("expires_at", 0) or 0)
     if subscription_expires and now >= subscription_expires:
@@ -2404,6 +2421,7 @@ def issue_enrollment_challenge(token, device_id, public_key_b64):
         reg = _align_registry()
         actual, item = _v31_find_enrollment(reg, digest)
         _v31_validate_enrollment_window(item, now)
+        protocol_version = _v31_protocol_version(item)
         state = str(item.get("enrollment_state") or "")
 
         if state == "unused":
@@ -2413,9 +2431,13 @@ def issue_enrollment_challenge(token, device_id, public_key_b64):
         elif state == "pending":
             _v31_require_same_device(item, device_id, key_sha256)
         elif state == "redeemed":
-            raise EnrollmentAlreadyUsedError(
-                "This one-time configuration has already been used"
-            )
+            if protocol_version < 2:
+                raise EnrollmentAlreadyUsedError(
+                    "This one-time configuration has already been used"
+                )
+            # v2 completion is idempotent: the same bound device may request a
+            # fresh proof challenge to finish cleanup after a lost response.
+            _v31_require_same_device(item, device_id, key_sha256)
         else:
             raise PermissionError("Enrollment is not active")
 
@@ -2432,17 +2454,61 @@ def issue_enrollment_challenge(token, device_id, public_key_b64):
     }
 
 
+def _v31_decode_signed_proof(signature_b64):
+    try:
+        return base64.b64decode(signature_b64, validate=True)
+    except Exception:
+        raise ValueError("Invalid device signature")
+
+
+def _v31_verify_signed_challenge(
+    item,
+    token,
+    device_id,
+    key_sha256,
+    public_key,
+    challenge,
+    signature,
+    claim_version,
+    now,
+):
+    challenge = str(challenge or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32,256}", challenge):
+        raise ValueError("Invalid enrollment challenge")
+
+    _v31_require_same_device(item, device_id, key_sha256)
+
+    stored_challenge_hash = str(item.get("enrollment_challenge_hash") or "")
+    challenge_expires = int(item.get("enrollment_challenge_expires_at", 0) or 0)
+    if not stored_challenge_hash or challenge_expires <= now:
+        raise PermissionError("Enrollment challenge expired")
+    if not _v31_hmac.compare_digest(
+        stored_challenge_hash,
+        _v31_token_hash(challenge),
+    ):
+        raise PermissionError("Invalid enrollment challenge")
+
+    message = (
+        claim_version + "\n"
+        + token + "\n"
+        + device_id + "\n"
+        + challenge
+    ).encode("utf-8")
+    try:
+        public_key.verify(
+            signature,
+            message,
+            _v31_ec.ECDSA(_v31_hashes.SHA256()),
+        )
+    except _V31InvalidSignature:
+        raise PermissionError("Invalid device proof")
+
+
 def redeem_enrollment(token, device_id, public_key_b64, challenge, signature_b64):
     token, device_id, key_sha256, public_key = _v31_decode_device_identity(
         token, device_id, public_key_b64
     )
-    challenge = str(challenge or "").strip()
-    if not re.fullmatch(r"[A-Za-z0-9_-]{32,256}", challenge):
-        raise ValueError("Invalid enrollment challenge")
-    try:
-        signature = base64.b64decode(signature_b64, validate=True)
-    except Exception:
-        raise ValueError("Invalid device signature")
+    signature = _v31_decode_signed_proof(signature_b64)
 
     digest = _v31_token_hash(token)
     now = int(time.time())
@@ -2454,43 +2520,34 @@ def redeem_enrollment(token, device_id, public_key_b64, challenge, signature_b64
         reg = _align_registry()
         actual, item = _v31_find_enrollment(reg, digest)
         _v31_validate_enrollment_window(item, now)
+        protocol_version = _v31_protocol_version(item)
         state = str(item.get("enrollment_state") or "")
-        if state not in ("pending", "redeemed"):
+
+        if state == "redeemed":
+            raise EnrollmentAlreadyUsedError(
+                "This one-time configuration has already been used"
+            )
+        if state != "pending":
             raise PermissionError("Enrollment challenge is required")
 
-        _v31_require_same_device(item, device_id, key_sha256)
+        _v31_verify_signed_challenge(
+            item,
+            token,
+            device_id,
+            key_sha256,
+            public_key,
+            challenge,
+            signature,
+            "slipnet-enroll-challenge-v1",
+            now,
+        )
 
-        stored_challenge_hash = str(item.get("enrollment_challenge_hash") or "")
-        challenge_expires = int(item.get("enrollment_challenge_expires_at", 0) or 0)
-        if not stored_challenge_hash or challenge_expires <= now:
-            raise PermissionError("Enrollment challenge expired")
-        if not _v31_hmac.compare_digest(
-            stored_challenge_hash,
-            _v31_token_hash(challenge),
-        ):
-            raise PermissionError("Invalid enrollment challenge")
-
-        message = (
-            "slipnet-enroll-challenge-v1\n"
-            + token + "\n"
-            + device_id + "\n"
-            + challenge
-        ).encode("utf-8")
-        try:
-            public_key.verify(
-                signature,
-                message,
-                _v31_ec.ECDSA(_v31_hashes.SHA256()),
-            )
-        except _V31InvalidSignature:
-            raise PermissionError("Invalid device proof")
-
-        item["enrollment_state"] = "redeemed"
-        if not int(item.get("enrollment_redeemed_at", 0) or 0):
-            item["enrollment_redeemed_at"] = now
-        # Keep only the last signed challenge until its short TTL expires so
-        # the exact same redeem POST can be replayed after a lost response.
-        # No new challenge can be issued once state is redeemed.
+        if not int(item.get("enrollment_bundle_issued_at", 0) or 0):
+            item["enrollment_bundle_issued_at"] = now
+        if protocol_version == 1:
+            item["enrollment_state"] = "redeemed"
+            if not int(item.get("enrollment_redeemed_at", 0) or 0):
+                item["enrollment_redeemed_at"] = now
         lock_hash = str(item.get("profile_lock_hash") or "")
         expires_at = int(item.get("expires_at", 0) or 0)
         _align_atomic_json(_ALIGN_REGISTRY_FILE, reg)
@@ -2512,18 +2569,81 @@ def redeem_enrollment(token, device_id, public_key_b64, challenge, signature_b64
         "profile_version": 29,
         "device_bound": True,
         "device_id": device_id,
+        "enrollment_protocol_version": protocol_version,
+        "enrollment_state": (
+            "redeemed" if protocol_version == 1 else "pending"
+        ),
+    }
+
+
+def complete_enrollment(token, device_id, public_key_b64, challenge, signature_b64):
+    token, device_id, key_sha256, public_key = _v31_decode_device_identity(
+        token, device_id, public_key_b64
+    )
+    signature = _v31_decode_signed_proof(signature_b64)
+
+    digest = _v31_token_hash(token)
+    now = int(time.time())
+
+    with _ALIGN_REGISTRY_LOCK:
+        reg = _align_registry()
+        actual, item = _v31_find_enrollment(reg, digest)
+        _v31_validate_enrollment_window(item, now)
+        protocol_version = _v31_protocol_version(item)
+        if protocol_version < 2:
+            raise PermissionError(
+                "Enrollment protocol does not require completion"
+            )
+        state = str(item.get("enrollment_state") or "")
+
+        if state not in ("pending", "redeemed"):
+            raise PermissionError("Enrollment is not ready for completion")
+
+        _v31_verify_signed_challenge(
+            item,
+            token,
+            device_id,
+            key_sha256,
+            public_key,
+            challenge,
+            signature,
+            "slipnet-enroll-complete-v1",
+            now,
+        )
+
+        if state == "pending":
+            if not int(item.get("enrollment_bundle_issued_at", 0) or 0):
+                raise PermissionError(
+                    "Enrollment bundle must be issued before completion"
+                )
+            item["enrollment_state"] = "redeemed"
+            if not int(item.get("enrollment_redeemed_at", 0) or 0):
+                item["enrollment_redeemed_at"] = now
+            _align_atomic_json(_ALIGN_REGISTRY_FILE, reg)
+
+    return {
+        "success": True,
+        "name": actual,
+        "device_bound": True,
+        "device_id": device_id,
         "enrollment_state": "redeemed",
     }
 
 
-def _v31_rotate_vless_uuid(name):
-    # Snapshot current raw counters into durable totals before Xray runtime
-    # removes/re-adds the email and potentially resets raw per-user counters.
-    _v31_base_list_users()
+def _v31_replace_vless_uuid(name, replacement_uuid, snapshot_usage=True):
+    if snapshot_usage:
+        # Snapshot current raw counters into durable totals before Xray runtime
+        # removes/re-adds the email and potentially resets raw per-user counters.
+        _v31_base_list_users()
 
     meta = _v30_registry_item(name)
     if str(meta.get("access_state") or "active") != "active":
         raise RuntimeError("Reset Device requires an active subscription")
+
+    try:
+        replacement_uuid = str(uuidlib.UUID(str(replacement_uuid)))
+    except Exception:
+        raise ValueError("Replacement VLESS UUID is invalid")
 
     with LOCK:
         cfg = _load()
@@ -2538,8 +2658,12 @@ def _v31_rotate_vless_uuid(name):
         if old_client is None:
             raise ValueError("User not found")
 
+        old_uuid = str(old_client.get("id") or "")
+        if old_uuid == replacement_uuid:
+            return old_uuid, replacement_uuid
+
         new_client = copy.deepcopy(old_client)
-        new_client["id"] = str(uuidlib.uuid4())
+        new_client["id"] = replacement_uuid
         new_cfg = copy.deepcopy(cfg)
         _clients(new_cfg)[index] = copy.deepcopy(new_client)
         _validate_config(new_cfg)
@@ -2550,45 +2674,161 @@ def _v31_rotate_vless_uuid(name):
             _runtime_add(new_client, cfg)
             new_runtime_added = True
             _persist(new_cfg)
-        except Exception:
+        except Exception as exc:
+            rollback_errors = []
             if new_runtime_added:
                 try:
                     _runtime_remove(new_client.get("email") or name)
-                except Exception:
-                    pass
-            # Restore exactly once. Failure to restore is intentionally not
-            # hidden behind a second add attempt.
+                except Exception as rollback_exc:
+                    rollback_errors.append("remove-new: " + str(rollback_exc))
             try:
                 _runtime_add(old_client, cfg)
-            except Exception:
-                pass
+            except Exception as rollback_exc:
+                rollback_errors.append("restore-old: " + str(rollback_exc))
+            if rollback_errors:
+                raise RuntimeError(
+                    "VLESS credential replacement failed and runtime rollback was incomplete: "
+                    + "; ".join(rollback_errors)
+                ) from exc
             raise
 
-    return new_client["id"]
+    return old_uuid, replacement_uuid
+
+
+def _v31_rotate_vless_uuid(name):
+    old_uuid, new_uuid = _v31_replace_vless_uuid(
+        name,
+        str(uuidlib.uuid4()),
+        snapshot_usage=True,
+    )
+    return old_uuid, new_uuid
+
+
+def _v31_snapshot_reissue_state(name):
+    meta = _v30_registry_item(name)
+    artifact = _v30_artifact_path(name)
+    if artifact.exists():
+        return meta, artifact.read_bytes(), artifact.stat().st_mode & 0o777
+    return meta, None, None
+
+
+def _v31_restore_reissue_state(name, meta, artifact_bytes, artifact_mode):
+    with _ALIGN_REGISTRY_LOCK:
+        reg = _align_registry()
+        users = reg.setdefault("users", {})
+        key = name.lower()
+        if meta:
+            users[key] = copy.deepcopy(meta)
+        else:
+            users.pop(key, None)
+        _align_atomic_json(_ALIGN_REGISTRY_FILE, reg)
+
+    artifact = _v30_artifact_path(name)
+    if artifact_bytes is None:
+        artifact.unlink(missing_ok=True)
+        return
+
+    _align_mkdirs()
+    fd, tmp = tempfile.mkstemp(
+        prefix=".profile-rollback-",
+        dir=str(_ALIGN_PROFILE_DIR),
+    )
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(artifact_bytes)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, artifact_mode or 0o600)
+        os.replace(tmp, artifact)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def reissue_enrollment(name):
-    _, client = _get_client(name)
-    actual = client.get("email") or _validate_name(name)
-    meta = _v30_registry_item(actual)
+    with _V31_REISSUE_LOCK:
+        _, client = _get_client(name)
+        actual = client.get("email") or _validate_name(name)
+        meta = _v30_registry_item(actual)
 
-    # Legacy users may predate the managed-profile registry entirely. Prepare
-    # the lock metadata without touching their working VLESS credential. If
-    # credential rotation later fails, the old credential remains usable.
-    if not meta.get("profile_lock_hash"):
-        _v30_registry_update(actual, {
-            "managed_profile": True,
-            "profile_lock_hash": _v30_password_hash(_align_secrets.token_urlsafe(32)),
-            "created_at": int(meta.get("created_at", 0) or int(time.time())),
-            "expires_at": int(meta.get("expires_at", 0) or 0),
-            "quota_bytes": int(meta.get("quota_bytes", 0) or 0),
-            "access_state": str(meta.get("access_state") or "active"),
-        })
+        if str(meta.get("access_state") or "active") != "active":
+            raise RuntimeError("Reset Device requires an active subscription")
 
-    _v31_rotate_vless_uuid(actual)
-    result = _v31_issue_enrollment(actual)
-    result["credential_rotated"] = True
-    return result
+        previous_meta, previous_artifact, previous_mode = (
+            _v31_snapshot_reissue_state(actual)
+        )
+
+        # Preflight and refresh the complete pair before revoking the working
+        # credential. A missing or unhealthy Primary/Backup pair must fail
+        # while the old credential is still untouched.
+        _vwa.refresh_pair(actual, _vwa_ws_path())
+
+        rotated = False
+        rollback_uuid = None
+        try:
+            # Legacy users may predate the managed-profile registry entirely.
+            # Seed one-time lock metadata only inside the transaction so it can
+            # be restored exactly if any later step fails.
+            if not meta.get("profile_lock_hash"):
+                _v30_registry_update(actual, {
+                    "managed_profile": True,
+                    "profile_lock_hash": _v30_password_hash(
+                        _align_secrets.token_urlsafe(32)
+                    ),
+                    "created_at": int(meta.get("created_at", 0) or int(time.time())),
+                    "expires_at": int(meta.get("expires_at", 0) or 0),
+                    "quota_bytes": int(meta.get("quota_bytes", 0) or 0),
+                    "access_state": str(meta.get("access_state") or "active"),
+                })
+
+            rollback_uuid, _ = _v31_rotate_vless_uuid(actual)
+            rotated = True
+
+            # Workers were already refreshed and health-checked above. Do not
+            # repeat external mutation after revoking the old credential.
+            result = _v31_issue_enrollment(
+                actual,
+                refresh_workers=False,
+            )
+            result["credential_rotated"] = True
+            return result
+
+        except Exception as exc:
+            rollback_errors = []
+
+            if rotated and rollback_uuid:
+                try:
+                    _v31_replace_vless_uuid(
+                        actual,
+                        rollback_uuid,
+                        snapshot_usage=False,
+                    )
+                except Exception as rollback_exc:
+                    rollback_errors.append(
+                        "credential: " + str(rollback_exc)
+                    )
+
+            try:
+                _v31_restore_reissue_state(
+                    actual,
+                    previous_meta,
+                    previous_artifact,
+                    previous_mode,
+                )
+            except Exception as rollback_exc:
+                rollback_errors.append(
+                    "enrollment-state: " + str(rollback_exc)
+                )
+
+            if rollback_errors:
+                raise RuntimeError(
+                    "Reset Device failed and rollback was incomplete: "
+                    + "; ".join(rollback_errors)
+                ) from exc
+            raise
 
 
 def add_user(name, duration_days=30, quota_bytes=0, delivery_password=""):
@@ -2626,6 +2866,11 @@ def list_users():
         item = registry.get(str(user.get("name") or "").lower(), {})
         state = str(item.get("enrollment_state") or "legacy")
         user["enrollment_state"] = state
+        user["enrollment_protocol_version"] = (
+            _v31_protocol_version(item)
+            if item.get("enrollment_token_hash")
+            else 0
+        )
         user["device_bound"] = bool(item.get("bound_device_key_sha256"))
         user["enrollment_redeemed_at"] = int(item.get("enrollment_redeemed_at", 0) or 0)
         user["enrollment_expires_at"] = int(item.get("enrollment_expires_at", 0) or 0)
@@ -2647,10 +2892,19 @@ def config_payload(name):
         raise RuntimeError(
             "Legacy user has no one-time binding; use Reset Device to revoke the old credential and issue a one-time file"
         )
+
+    access_state = str(meta.get("access_state") or "active")
+    if access_state != "active":
+        raise RuntimeError("Subscription is not active")
+
     if state == "redeemed":
         raise RuntimeError("Enrollment already activated; use Reset Device to issue a new one-time file")
     if state != "unused":
         raise RuntimeError("Enrollment is not available")
+
+    enrollment_expires_at = int(meta.get("enrollment_expires_at", 0) or 0)
+    if enrollment_expires_at and int(time.time()) >= enrollment_expires_at:
+        return _v31_issue_enrollment(actual)
 
     if not path.exists():
         return _v31_issue_enrollment(actual)
@@ -2665,7 +2919,7 @@ def config_payload(name):
         "uri": uri,
         "filename": path.name,
         "profile_count": 2,
-        "version": 1,
+        "version": _v31_protocol_version(meta),
         "one_time_enrollment": True,
         "enrollment_state": "unused",
         "enrollment_expires_at": int(meta.get("enrollment_expires_at", 0) or 0),

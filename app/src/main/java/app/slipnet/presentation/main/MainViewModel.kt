@@ -3,6 +3,8 @@ package app.slipnet.presentation.main
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import app.slipnet.data.enrollment.EnrollmentManager
+import app.slipnet.data.enrollment.EnrollmentPairValidator
+import app.slipnet.data.enrollment.ManagedEnrollmentPair
 import app.slipnet.data.export.ConfigExporter
 import app.slipnet.data.export.ConfigImporter
 import app.slipnet.data.export.ImportResult
@@ -387,11 +389,86 @@ class MainViewModel @Inject constructor(
         }
     }
 
+    private fun hasSameEnrollmentIdentity(
+        stored: ServerProfile,
+        incoming: ServerProfile,
+    ): Boolean =
+        stored.tunnelType == TunnelType.VLESS &&
+            incoming.tunnelType == TunnelType.VLESS &&
+            stored.name == incoming.name &&
+            stored.vlessUuid == incoming.vlessUuid &&
+            stored.domain == incoming.domain &&
+            stored.boundDeviceId == incoming.boundDeviceId &&
+            stored.vlessFailureProviderId == incoming.vlessFailureProviderId &&
+            stored.vlessFailureAccountId == incoming.vlessFailureAccountId &&
+            stored.vlessFailureHostname == incoming.vlessFailureHostname
+
+    private suspend fun finalizePendingEnrollment(
+        placeholder: ServerProfile,
+        enrollment: String,
+        managedPair: ManagedEnrollmentPair,
+    ): Result<ServerProfile> = runCatching {
+        enrollmentManager.complete(enrollment).getOrThrow()
+
+        setActiveProfileUseCase(managedPair.primary.id)
+        val deleted = deleteProfileUseCase(placeholder.id)
+        deleted.exceptionOrNull()?.let { throw it }
+        preferencesDataStore.clearPendingEnrollment(placeholder.id)
+
+        managedPair.primary
+    }
+
     private suspend fun connectPendingEnrollment(
         placeholder: ServerProfile,
         enrollment: String,
     ) {
         _uiState.value = _uiState.value.copy(enrollmentInProgress = true, error = null)
+
+        val localDeviceId = connectionManager.getDeviceId()
+        val recoveryIds = preferencesDataStore.getPendingEnrollmentPair(placeholder.id)
+        if (recoveryIds != null) {
+            val primary = profileRepository.getProfileById(recoveryIds.first)
+            val backup = profileRepository.getProfileById(recoveryIds.second)
+            if (primary == null || backup == null) {
+                _uiState.value = _uiState.value.copy(
+                    enrollmentInProgress = false,
+                    error = "Enrollment recovery data is incomplete; reset this device enrollment",
+                )
+                return
+            }
+
+            val recovered = EnrollmentPairValidator.validate(
+                listOf(primary, backup),
+                localDeviceId,
+            )
+            if (recovered.isFailure) {
+                _uiState.value = _uiState.value.copy(
+                    enrollmentInProgress = false,
+                    error = recovered.exceptionOrNull()?.message
+                        ?: "Enrollment recovery pair is invalid",
+                )
+                return
+            }
+
+            val completed = finalizePendingEnrollment(
+                placeholder,
+                enrollment,
+                recovered.getOrThrow(),
+            )
+            completed.onSuccess { activePrimary ->
+                _uiState.value = _uiState.value.copy(
+                    enrollmentInProgress = false,
+                    error = null,
+                )
+                connectionManager.connect(activePrimary)
+            }.onFailure { error ->
+                _uiState.value = _uiState.value.copy(
+                    enrollmentInProgress = false,
+                    error = error.message ?: "Failed to finish enrollment recovery",
+                )
+            }
+            return
+        }
 
         val bundle = enrollmentManager.redeem(enrollment).getOrElse { error ->
             _uiState.value = _uiState.value.copy(
@@ -403,33 +480,82 @@ class MainViewModel @Inject constructor(
 
         when (val result = configImporter.parseAndImport(
             bundle,
-            connectionManager.getDeviceId(),
+            localDeviceId,
             null,
         )) {
             is ImportResult.Success -> {
+                val validated = EnrollmentPairValidator.validate(
+                    result.profiles,
+                    localDeviceId,
+                )
+                if (validated.isFailure) {
+                    _uiState.value = _uiState.value.copy(
+                        enrollmentInProgress = false,
+                        error = validated.exceptionOrNull()?.message
+                            ?: "Enrollment returned an invalid Primary/Backup pair",
+                    )
+                    return
+                }
+
+                val managedPair = validated.getOrThrow()
+                val managedProfiles = listOf(
+                    managedPair.primary,
+                    managedPair.backup,
+                )
+                val existingProfiles = getProfilesUseCase().first()
                 val saved = mutableListOf<Pair<ServerProfile, Long>>()
+                val createdIds = mutableListOf<Long>()
+                var recoveryMarkerWritten = false
+
                 try {
-                    for (profile in result.profiles.reversed()) {
-                        saved += profile to saveProfileUseCase(profile)
+                    for (profile in managedProfiles.reversed()) {
+                        val matches = existingProfiles.filter {
+                            it.id != placeholder.id &&
+                                hasSameEnrollmentIdentity(it, profile)
+                        }
+                        require(matches.size <= 1) {
+                            "Enrollment recovery found duplicate managed profiles"
+                        }
+
+                        val id = matches.singleOrNull()?.id
+                            ?: saveProfileUseCase(profile).also { createdIds += it }
+                        saved += profile to id
                     }
 
-                    val primarySource = result.profiles.firstOrNull()
-                        ?: error("Enrollment returned no usable profiles")
-                    val primaryId = saved.first { it.first == primarySource }.second
-                    val primary = primarySource.copy(id = primaryId)
+                    val primaryId = saved.first {
+                        it.first == managedPair.primary
+                    }.second
+                    val backupId = saved.first {
+                        it.first == managedPair.backup
+                    }.second
+                    val persistedPair = ManagedEnrollmentPair(
+                        primary = managedPair.primary.copy(id = primaryId),
+                        backup = managedPair.backup.copy(id = backupId),
+                    )
 
-                    setActiveProfileUseCase(primary.id)
-                    val deleted = deleteProfileUseCase(placeholder.id)
-                    deleted.exceptionOrNull()?.let { throw it }
-                    preferencesDataStore.clearPendingEnrollment(placeholder.id)
+                    preferencesDataStore.setPendingEnrollmentPair(
+                        placeholder.id,
+                        primaryId,
+                        backupId,
+                    )
+                    recoveryMarkerWritten = true
+
+                    val activePrimary = finalizePendingEnrollment(
+                        placeholder,
+                        enrollment,
+                        persistedPair,
+                    ).getOrThrow()
+
                     _uiState.value = _uiState.value.copy(
                         enrollmentInProgress = false,
                         error = null,
                     )
-                    connectionManager.connect(primary)
+                    connectionManager.connect(activePrimary)
                 } catch (error: Exception) {
-                    for ((_, id) in saved) {
-                        runCatching { deleteProfileUseCase(id) }
+                    if (!recoveryMarkerWritten) {
+                        for (id in createdIds) {
+                            runCatching { deleteProfileUseCase(id) }
+                        }
                     }
                     _uiState.value = _uiState.value.copy(
                         enrollmentInProgress = false,

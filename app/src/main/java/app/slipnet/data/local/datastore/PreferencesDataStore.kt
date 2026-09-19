@@ -215,6 +215,9 @@ class PreferencesDataStore @Inject constructor(
     private fun pendingEnrollmentKey(profileId: Long) =
         stringPreferencesKey("pending_enrollment_${profileId}_v1")
 
+    private fun pendingEnrollmentPairKey(profileId: Long) =
+        stringPreferencesKey("pending_enrollment_pair_${profileId}_v1")
+
     suspend fun setPendingEnrollment(profileId: Long, enrollmentUri: String) {
         require(profileId > 0L) { "Pending enrollment requires a saved profile" }
         dataStore.edit { prefs ->
@@ -227,10 +230,50 @@ class PreferencesDataStore @Inject constructor(
         return dataStore.data.first()[pendingEnrollmentKey(profileId)]
     }
 
+    suspend fun setPendingEnrollmentPair(
+        profileId: Long,
+        primaryProfileId: Long,
+        backupProfileId: Long,
+    ) {
+        require(profileId > 0L) { "Pending enrollment requires a saved placeholder" }
+        require(primaryProfileId > 0L && backupProfileId > 0L) {
+            "Pending enrollment pair requires saved profiles"
+        }
+        require(primaryProfileId != backupProfileId) {
+            "Pending enrollment pair profiles must be distinct"
+        }
+        dataStore.edit { prefs ->
+            prefs[pendingEnrollmentPairKey(profileId)] =
+                "$primaryProfileId:$backupProfileId"
+        }
+    }
+
+    suspend fun getPendingEnrollmentPair(profileId: Long): Pair<Long, Long>? {
+        if (profileId <= 0L) return null
+        val raw = dataStore.data.first()[pendingEnrollmentPairKey(profileId)]
+            ?: return null
+        val parts = raw.split(":")
+        if (parts.size != 2) return null
+        val primaryId = parts[0].toLongOrNull() ?: return null
+        val backupId = parts[1].toLongOrNull() ?: return null
+        if (primaryId <= 0L || backupId <= 0L || primaryId == backupId) {
+            return null
+        }
+        return primaryId to backupId
+    }
+
+    suspend fun clearPendingEnrollmentPair(profileId: Long) {
+        if (profileId <= 0L) return
+        dataStore.edit { prefs ->
+            prefs.remove(pendingEnrollmentPairKey(profileId))
+        }
+    }
+
     suspend fun clearPendingEnrollment(profileId: Long) {
         if (profileId <= 0L) return
         dataStore.edit { prefs ->
             prefs.remove(pendingEnrollmentKey(profileId))
+            prefs.remove(pendingEnrollmentPairKey(profileId))
         }
     }
 
