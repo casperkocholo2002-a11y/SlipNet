@@ -38,10 +38,15 @@ jobs:
 
       - name: Install Android SDK components
         run: |
-          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          TOOLS_ZIP="$RUNNER_TEMP/android-commandlinetools.zip"
+          TOOLS_DIR="$RUNNER_TEMP/android-commandlinetools"
+          curl -fsSL "https://dl.google.com/android/repository/commandlinetools-linux-12266719_latest.zip" -o "$TOOLS_ZIP"
+          mkdir -p "$TOOLS_DIR"
+          unzip -q "$TOOLS_ZIP" -d "$TOOLS_DIR"
+          SDKMANAGER="$TOOLS_DIR/cmdline-tools/bin/sdkmanager"
           test -x "$SDKMANAGER"
-          yes | "$SDKMANAGER" --licenses >/dev/null
-          "$SDKMANAGER" --install "platform-tools" "platforms;android-37" "build-tools;37.0.0" "ndk;29.0.14206865"
+          yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --licenses >/dev/null || true
+          "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --install "platform-tools" "platforms;android-37" "build-tools;37.0.0" "ndk;29.0.14206865"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
 
       - name: Configure Android local.properties
