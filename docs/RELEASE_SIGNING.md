@@ -59,6 +59,8 @@ The ephemeral test key is never a production signer and must never be used for a
 
 ## GitHub Actions
 
+Personal EA deliberately does not recursively initialize legacy DNS/Rust submodules in CI. The Personal flavor builds successfully from a fresh checkout with no submodules initialized; its required Go artifacts are already tracked AARs, and its release path does not depend on the Slipstream Rust cargo task. This avoids stale/unavailable LAB submodules from blocking VLESS-only Personal releases.
+
 `.github/workflows/personal-ea-release.yml` is manual-only and fail-closed. It:
 
 1. builds and validates the unsigned Personal EA candidate;
