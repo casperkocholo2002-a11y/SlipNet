@@ -21,7 +21,7 @@ permissions:
   contents: read
 
 env:
-  OPENSSL_VERSION: "3.0.15"
+  ANDROID_HOME: /usr/local/lib/android/sdk
 
 jobs:
   qualify-and-sign:
@@ -38,8 +38,10 @@ jobs:
 
       - name: Install Android SDK components
         run: |
-          yes | sdkmanager --licenses >/dev/null
-          sdkmanager --install "platform-tools" "platforms;android-37" "build-tools;37.0.0" "ndk;29.0.14206865"
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null
+          "$SDKMANAGER" --install "platform-tools" "platforms;android-37" "build-tools;37.0.0" "ndk;29.0.14206865"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
 
       - name: Configure Android local.properties
