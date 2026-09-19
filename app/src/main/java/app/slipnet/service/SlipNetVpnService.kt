@@ -3359,14 +3359,18 @@ class SlipNetVpnService : VpnService() {
         val accessState: String,
     )
 
+    private class OptionalSubscriptionAuthorityException(message: String) : Exception(message)
+    private class FatalSubscriptionAuthorityException(message: String) : Exception(message)
+
     private suspend fun fetchManagedSubscriptionUsage(
         profile: app.slipnet.domain.model.ServerProfile,
         proxyHost: String,
         proxyPort: Int,
+        timeoutMs: Int = 10_000,
     ): Result<ManagedSubscriptionUsage> = withContext(Dispatchers.IO) {
-        if (!profile.isLocked || profile.vlessUuid.isBlank()) {
+        if (profile.vlessUuid.isBlank()) {
             return@withContext Result.failure(
-                IllegalStateException("Managed subscription identity is missing")
+                IllegalStateException("VLESS subscription identity is missing")
             )
         }
 
@@ -3376,8 +3380,8 @@ class SlipNetVpnService : VpnService() {
                 InetSocketAddress(proxyHost, proxyPort)
             )
             Socket(proxy).use { socket ->
-                socket.soTimeout = 10_000
-                socket.connect(InetSocketAddress("127.0.0.1", 8080), 10_000)
+                socket.soTimeout = timeoutMs
+                socket.connect(InetSocketAddress("127.0.0.1", 8080), timeoutMs)
 
                 val request = buildString {
                     append("GET /api/subscription/usage HTTP/1.1\r\n")
@@ -3400,8 +3404,19 @@ class SlipNetVpnService : VpnService() {
                         if (b != '\r'.code) append(b.toChar())
                     }
                 }
-                if (!statusLine.contains(" 200 ")) {
-                    throw IllegalStateException("Subscription authority rejected request")
+                val statusCode = statusLine
+                    .split(' ')
+                    .getOrNull(1)
+                    ?.toIntOrNull()
+                    ?: -1
+                when (statusCode) {
+                    200 -> Unit
+                    403 -> throw OptionalSubscriptionAuthorityException(
+                        "VLESS UUID is not managed by this SlipNet authority"
+                    )
+                    else -> throw FatalSubscriptionAuthorityException(
+                        "Subscription authority returned HTTP $statusCode"
+                    )
                 }
 
                 var contentLength = -1
@@ -3457,7 +3472,20 @@ class SlipNetVpnService : VpnService() {
             }
         } catch (error: Exception) {
             Log.operational("SUBSCRIPTION_USAGE_SYNC_FAILED")
-            Result.failure(error)
+            val normalized = when (error) {
+                is OptionalSubscriptionAuthorityException,
+                is FatalSubscriptionAuthorityException -> error
+                is java.net.ConnectException,
+                is java.net.NoRouteToHostException,
+                is java.net.SocketTimeoutException,
+                is java.net.SocketException -> OptionalSubscriptionAuthorityException(
+                    "No SlipNet subscription authority endpoint is available"
+                )
+                else -> FatalSubscriptionAuthorityException(
+                    error.message ?: "Subscription authority failed"
+                )
+            }
+            Result.failure(normalized)
         }
     }
 
@@ -3546,12 +3574,32 @@ class SlipNetVpnService : VpnService() {
 
             var managedUsage: ManagedSubscriptionUsage? = null
             if (BuildConfig.PERSONAL_BUILD) {
+                vpnRepository.clearServerAuthoritativeUsageSession()
                 val authResult = if (profile.isLocked) {
                     fetchManagedSubscriptionUsage(profile, proxyHost, proxyPort)
                         .also { result -> managedUsage = result.getOrNull() }
                         .map { Unit }
                 } else {
-                    withContext(Dispatchers.IO) { VlessBridge.probeAuthenticated() }
+                    val authProbe = withContext(Dispatchers.IO) { VlessBridge.probeAuthenticated() }
+                    if (authProbe.isFailure) {
+                        authProbe
+                    } else {
+                        val usageResult = fetchManagedSubscriptionUsage(
+                            profile,
+                            proxyHost,
+                            proxyPort,
+                            timeoutMs = 2_500,
+                        ).onSuccess { managedUsage = it }
+                        val usageFailure = usageResult.exceptionOrNull()
+                        if (
+                            usageFailure != null &&
+                            usageFailure !is OptionalSubscriptionAuthorityException
+                        ) {
+                            Result.failure(usageFailure)
+                        } else {
+                            authProbe
+                        }
+                    }
                 }
                 if (authResult.isFailure) {
                     val reason = authResult.exceptionOrNull()?.message ?: "VLESS authentication failed"
@@ -3655,12 +3703,32 @@ class SlipNetVpnService : VpnService() {
 
         var managedUsage: ManagedSubscriptionUsage? = null
         if (BuildConfig.PERSONAL_BUILD) {
+            vpnRepository.clearServerAuthoritativeUsageSession()
             val authResult = if (profile.isLocked) {
                 fetchManagedSubscriptionUsage(profile, proxyHost, proxyPort)
                     .also { result -> managedUsage = result.getOrNull() }
                     .map { Unit }
             } else {
-                withContext(Dispatchers.IO) { VlessBridge.probeAuthenticated() }
+                val authProbe = withContext(Dispatchers.IO) { VlessBridge.probeAuthenticated() }
+                if (authProbe.isFailure) {
+                    authProbe
+                } else {
+                    val usageResult = fetchManagedSubscriptionUsage(
+                        profile,
+                        proxyHost,
+                        proxyPort,
+                        timeoutMs = 2_500,
+                    ).onSuccess { managedUsage = it }
+                    val usageFailure = usageResult.exceptionOrNull()
+                    if (
+                        usageFailure != null &&
+                        usageFailure !is OptionalSubscriptionAuthorityException
+                    ) {
+                        Result.failure(usageFailure)
+                    } else {
+                        authProbe
+                    }
+                }
             }
             if (authResult.isFailure) {
                 val reason = authResult.exceptionOrNull()?.message ?: "VLESS authentication failed"

@@ -403,7 +403,15 @@ def get_all_data():
     try:
         vless_users = vless_admin.list_users_with_activity()
     except Exception:
-        vless_users = []
+        try:
+            vless_users = vless_admin.list_users()
+            for vless in vless_users:
+                vless.setdefault("activity", [])
+                vless.setdefault("current_services", [])
+                vless.setdefault("last_destination", None)
+        except Exception:
+            vless_users = []
+    data["vless_users"] = vless_users
     for vless in vless_users:
         raw_name = vless["name"]
         key = _user_key(data["users"], raw_name)
@@ -1185,6 +1193,7 @@ async function loadVlessUsers() {
           <div class="vless-user-state">
             ${u.access_state === 'active' ? (u.online ? 'Online' : 'Offline') : ('Blocked · ' + vlessEsc(u.access_state))}
             ${u.last_activity ? ' · ' + vlessEsc(u.last_activity) : ''}
+            · Enrollment: ${vlessEsc(u.enrollment_state || 'legacy')}${u.device_bound ? ' · Device bound' : ''}
           </div>
         </div>
 
@@ -1196,17 +1205,17 @@ async function loadVlessUsers() {
 
         <div class="vless-actions">
           <button class="vless-action-btn"
-                  onclick="copyVlessConfig('${vlessEsc(u.name)}')">Copy Encrypted</button>
+                  onclick="copyVlessConfig('${vlessEsc(u.name)}')">Copy One-Time</button>
           <button class="vless-action-btn"
                   onclick="showVlessQr('${vlessEsc(u.name)}')">QR</button>
           <button class="vless-action-btn"
-                  onclick="downloadVlessConfig('${vlessEsc(u.name)}')">Download EA</button>
+                  onclick="downloadVlessConfig('${vlessEsc(u.name)}')">Download One-Time</button>
           <button class="vless-action-btn"
                   onclick="editVlessLimits('${vlessEsc(u.name)}')">Limits</button>
           <button class="vless-action-btn"
                   onclick="resetVlessUsage('${vlessEsc(u.name)}')">Reset Usage</button>
           <button class="vless-action-btn"
-                  onclick="rotateVlessPassword('${vlessEsc(u.name)}')">Password</button>
+                  onclick="reissueVlessEnrollment('${vlessEsc(u.name)}')">Reset Device</button>
           <button class="vless-action-btn vless-delete-btn"
                   onclick="deleteVlessUser('${vlessEsc(u.name)}')">
             Delete
@@ -1231,9 +1240,6 @@ async function addVlessUser() {
   if (quotaRaw === null) return;
   const quotaGb = Number.parseFloat(quotaRaw);
   if (!Number.isFinite(quotaGb) || quotaGb < 0) { vlessMsg('Invalid traffic quota'); return; }
-  const password = prompt('Delivery/import password (minimum 6 characters):');
-  if (!password || password.length < 6) { vlessMsg('Password must be at least 6 characters'); return; }
-
   vlessMsg('Creating ' + name + '...');
   try {
     const r = await fetch('/api/vless/add', {
@@ -1242,13 +1248,12 @@ async function addVlessUser() {
       body: JSON.stringify({
         name,
         duration_days: days,
-        quota_bytes: Math.round(quotaGb * 1024 * 1024 * 1024),
-        password
+        quota_bytes: Math.round(quotaGb * 1024 * 1024 * 1024)
       })
     });
     const result = await r.json();
     if (!r.ok || !result.success) throw new Error(result.error || 'Create failed');
-    vlessMsg('User created: encrypted EA v29 Primary + Backup ready');
+    vlessMsg('User created: one-time EA enrollment ready');
     await loadVlessUsers();
     await downloadVlessConfig(result.name);
   } catch (e) {
@@ -1290,17 +1295,24 @@ async function resetVlessUsage(name) {
   await loadVlessUsers();
 }
 
-async function rotateVlessPassword(name) {
-  const password = prompt('New delivery/import password (minimum 6 characters):');
-  if (!password || password.length < 6) return;
-  const r = await fetch('/api/vless/password', {
+async function reissueVlessEnrollment(name) {
+  if (!confirm(
+    'Reset device for ' + name + '?\n\n' +
+    'The previous VLESS credential will be revoked immediately and a new one-time file will be issued.'
+  )) return;
+  const r = await fetch('/api/vless/reissue', {
     method:'POST',
     headers:{'Content-Type':'application/json','X-Requested-With':'SlipNetMonitor'},
-    body:JSON.stringify({name,password})
+    body:JSON.stringify({name})
   });
   const result = await r.json();
-  if (!r.ok || !result.success) { vlessMsg('Password rotation failed: '+(result.error||'unknown error')); return; }
-  vlessMsg('Encrypted artifact regenerated for ' + name);
+  if (!r.ok || !result.success) {
+    vlessMsg('Device reset failed: '+(result.error||'unknown error'));
+    return;
+  }
+  vlessMsg('Old device revoked; new one-time enrollment issued for ' + name);
+  await loadVlessUsers();
+  await downloadVlessConfig(name);
 }
 
 function showVlessQr(name) {
@@ -1361,7 +1373,7 @@ async function copyVlessConfig(name) {
       ta.remove();
     }
 
-    vlessMsg('EA v29 Primary + Backup copied for ' + name);
+    vlessMsg('One-time EA enrollment copied for ' + name);
 
   } catch (e) {
     vlessMsg('Copy failed: ' + e.message);
@@ -1375,7 +1387,7 @@ async function downloadVlessConfig(name) {
   document.body.appendChild(a);
   a.click();
   a.remove();
-  vlessMsg('Downloading EA v29 Primary + Backup for ' + name);
+  vlessMsg('Downloading one-time EA enrollment for ' + name);
 }
 
 window.__vlessLegacyTimeout = setTimeout(loadVlessUsers, 200);
@@ -1407,15 +1419,15 @@ function activityChip(a) {
 async function loadVlessUsers() {
   try {
     const r = await fetch(
-      '/api/vless/users',
-      {cache:'no-store'}
+      '/api/data',
+      {cache:'no-store', credentials:'same-origin'}
     );
 
     if (!r.ok)
       throw new Error('HTTP ' + r.status);
 
     const payload = await r.json();
-    const users = payload.users || [];
+    const users = payload.vless_users || [];
 
     const el =
       document.getElementById('vless-admin-list');
@@ -1462,10 +1474,12 @@ async function loadVlessUsers() {
             </div>
 
             <div class="vless-user-state">
-              ${u.online ? 'Online' : 'Offline'}
-              ${u.last_activity
-                ? ' · ' + vlessEsc(u.last_activity)
-                : ''}
+              ${u.access_state === 'active'
+                ? (u.online ? 'Online' : 'Offline')
+                : ('Blocked · ' + vlessEsc(u.access_state))}
+              ${u.last_activity ? ' · ' + vlessEsc(u.last_activity) : ''}
+              · Enrollment: ${vlessEsc(u.enrollment_state || 'legacy')}
+              ${u.device_bound ? ' · Device bound' : ''}
             </div>
           </div>
 
@@ -1488,19 +1502,20 @@ async function loadVlessUsers() {
           </div>
 
           <div class="vless-actions">
-            <button
-              class="vless-action-btn"
-              onclick="copyVlessConfig('${vlessEsc(u.name)}')">
-              Copy
-            </button>
-
             <button class="vless-action-btn"
-              onclick="downloadVlessConfig('${vlessEsc(u.name)}')">Download EA</button>
-            <button
-              class="vless-action-btn vless-delete-btn"
-              onclick="deleteVlessUser('${vlessEsc(u.name)}')">
-              Delete
-            </button>
+              onclick="copyVlessConfig('${vlessEsc(u.name)}')">Copy One-Time</button>
+            <button class="vless-action-btn"
+              onclick="showVlessQr('${vlessEsc(u.name)}')">QR</button>
+            <button class="vless-action-btn"
+              onclick="downloadVlessConfig('${vlessEsc(u.name)}')">Download One-Time</button>
+            <button class="vless-action-btn"
+              onclick="editVlessLimits('${vlessEsc(u.name)}')">Limits</button>
+            <button class="vless-action-btn"
+              onclick="resetVlessUsage('${vlessEsc(u.name)}')">Reset Usage</button>
+            <button class="vless-action-btn"
+              onclick="reissueVlessEnrollment('${vlessEsc(u.name)}')">Reset Device</button>
+            <button class="vless-action-btn vless-delete-btn"
+              onclick="deleteVlessUser('${vlessEsc(u.name)}')">Delete</button>
           </div>
 
         </div>
@@ -1508,6 +1523,11 @@ async function loadVlessUsers() {
     }).join('');
 
   } catch (e) {
+    const el = document.getElementById('vless-admin-list');
+    if (el) {
+      el.innerHTML =
+        '<div class="vless-loading">VLESS user list temporarily unavailable · retrying...</div>';
+    }
     vlessMsg(
       'VLESS API error: ' + e.message
     );
@@ -1610,9 +1630,22 @@ class Handler(BaseHTTPRequestHandler):
 
         if parsed.path == '/api/vless/users':
             try:
+                degraded_activity = False
+                try:
+                    users = vless_admin.list_users_with_activity()
+                except Exception:
+                    # User management must not disappear just because optional
+                    # recent-activity enrichment is unavailable.
+                    users = vless_admin.list_users()
+                    degraded_activity = True
+                    for user in users:
+                        user.setdefault("activity", [])
+                        user.setdefault("current_services", [])
+                        user.setdefault("last_destination", None)
                 self.send_json({
                     "success": True,
-                    "users": vless_admin.list_users_with_activity()
+                    "users": users,
+                    "degraded_activity": degraded_activity,
                 })
             except Exception as e:
                 self.send_json({
@@ -1686,12 +1719,45 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(HTML.encode())
 
     def do_POST(self):
-        if not self.check_auth():
-            return
-
         from urllib.parse import urlparse, parse_qs
 
         parsed = urlparse(self.path)
+
+        if parsed.path in ('/api/enrollment/challenge', '/api/enrollment/redeem'):
+            try:
+                length = int(self.headers.get('Content-Length', '0') or 0)
+                if length < 1 or length > 8192:
+                    raise ValueError("Invalid enrollment request size")
+                body = self.rfile.read(length)
+                payload = json.loads(body.decode("utf-8"))
+
+                if parsed.path == '/api/enrollment/challenge':
+                    result = vless_admin.issue_enrollment_challenge(
+                        payload.get("token", ""),
+                        payload.get("device_id", ""),
+                        payload.get("public_key", ""),
+                    )
+                else:
+                    result = vless_admin.redeem_enrollment(
+                        payload.get("token", ""),
+                        payload.get("device_id", ""),
+                        payload.get("public_key", ""),
+                        payload.get("challenge", ""),
+                        payload.get("signature", ""),
+                    )
+                self.send_json(result)
+            except vless_admin.EnrollmentAlreadyUsedError as e:
+                self.send_json({"success": False, "error": str(e)}, 409)
+            except PermissionError as e:
+                self.send_json({"success": False, "error": str(e)}, 403)
+            except ValueError as e:
+                self.send_json({"success": False, "error": str(e)}, 400)
+            except Exception:
+                self.send_json({"success": False, "error": "Enrollment unavailable"}, 503)
+            return
+
+        if not self.check_auth():
+            return
 
         if parsed.path in (
             '/api/vless/add',
@@ -1699,6 +1765,7 @@ class Handler(BaseHTTPRequestHandler):
             '/api/vless/limits',
             '/api/vless/reset-usage',
             '/api/vless/password',
+            '/api/vless/reissue',
         ):
 
             if self.headers.get('X-Requested-With') != 'SlipNetMonitor':
@@ -1736,6 +1803,8 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 elif parsed.path == '/api/vless/reset-usage':
                     result = vless_admin.reset_user_usage(username)
+                elif parsed.path == '/api/vless/reissue':
+                    result = vless_admin.reissue_enrollment(username)
                 else:
                     result = vless_admin.rotate_delivery_password(
                         username,

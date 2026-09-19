@@ -238,9 +238,9 @@ class VpnRepositoryImpl @Inject constructor(
     private var prevBytesReceived = 0L
     private var prevTimestamp = 0L
 
-    // Managed EA subscription usage persists across VPN disconnects/app restarts.
-    // Bridge counters remain per-process/session; only their positive delta is
-    // added to this durable per-profile total.
+    // Server-authoritative VLESS subscription usage persists across VPN
+    // disconnects/app restarts. Bridge counters remain per-process/session;
+    // only their positive delta is added to the last authoritative snapshot.
     private var managedUsageProfileId = -1L
     private var managedUsageTotalSent = 0L
     private var managedUsageTotalReceived = 0L
@@ -1243,6 +1243,14 @@ class VpnRepositoryImpl @Inject constructor(
         _trafficStats.value = stats
     }
 
+    fun clearServerAuthoritativeUsageSession() {
+        managedUsageProfileId = -1L
+        managedUsageTotalSent = 0L
+        managedUsageTotalReceived = 0L
+        managedUsageLastSessionSent = 0L
+        managedUsageLastSessionReceived = 0L
+    }
+
     fun resetSpeedTracking() {
         prevBytesSent = 0L
         prevBytesReceived = 0L
@@ -1261,7 +1269,6 @@ class VpnRepositoryImpl @Inject constructor(
     ) {
         if (
             profile.tunnelType != TunnelType.VLESS ||
-            !profile.isLocked ||
             profile.id <= 0L
         ) {
             return
@@ -1290,6 +1297,7 @@ class VpnRepositoryImpl @Inject constructor(
         _trafficStats.value = TrafficStats(
             bytesSent = managedUsageTotalSent,
             bytesReceived = managedUsageTotalReceived,
+            isServerAuthoritative = true,
         )
     }
 
@@ -1301,21 +1309,10 @@ class VpnRepositoryImpl @Inject constructor(
         if (
             currentTunnelType != TunnelType.VLESS ||
             profile == null ||
-            !profile.isLocked ||
-            profile.id <= 0L
+            profile.id <= 0L ||
+            managedUsageProfileId != profile.id
         ) {
             return Pair(sessionSent, sessionReceived)
-        }
-
-        if (managedUsageProfileId != profile.id) {
-            val stored = runBlocking(Dispatchers.IO) {
-                preferencesDataStore.getManagedProfileUsage(profile.id)
-            }
-            managedUsageProfileId = profile.id
-            managedUsageTotalSent = stored.first
-            managedUsageTotalReceived = stored.second
-            managedUsageLastSessionSent = 0L
-            managedUsageLastSessionReceived = 0L
         }
 
         val sentDelta = if (sessionSent >= managedUsageLastSessionSent) {
@@ -1430,7 +1427,12 @@ class VpnRepositoryImpl @Inject constructor(
             packetsSent = pktSent,
             packetsReceived = pktReceived,
             uploadSpeed = upSpeed,
-            downloadSpeed = downSpeed
+            downloadSpeed = downSpeed,
+            isServerAuthoritative = (
+                currentTunnelType == TunnelType.VLESS &&
+                connectedProfile?.id == managedUsageProfileId &&
+                managedUsageProfileId > 0L
+            )
         )
     }
 }

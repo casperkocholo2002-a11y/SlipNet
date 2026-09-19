@@ -14,8 +14,8 @@ plugins {
 }
 
 val minSdkVersion = 24
-val appVersionName = "2.5.5"
-val appVersionCode = 80
+val appVersionName = "2.5.6"
+val appVersionCode = 81
 val cargoProfile = (findProperty("CARGO_PROFILE") as String?) ?: run {
     val isRelease = gradle.startParameter.taskNames.any { it.contains("Release", ignoreCase = true) }
     if (isRelease) "release" else "debug"
@@ -98,6 +98,8 @@ android {
         // the public upstream release channel; a controlled URL can be enabled
         // later without changing UpdateChecker logic.
         buildConfigField("String", "UPDATE_API_URL", "\"https://api.github.com/repos/anonvector/SlipNet/releases/latest\"")
+        buildConfigField("String", "ENROLLMENT_API_URL", "\"\"")
+        buildConfigField("String", "ENROLLMENT_TRUSTED_WORKER_SUFFIXES", "\"\"")
 
     }
 
@@ -128,6 +130,8 @@ android {
             buildConfigField("boolean", "INCLUDE_VAYDNS", "false")
             buildConfigField("boolean", "INCLUDE_SLIPSTREAM", "false")
             buildConfigField("String", "UPDATE_API_URL", "\"https://api.github.com/repos/casperkocholo2002-a11y/SlipNet/releases/latest\"")
+            buildConfigField("String", "ENROLLMENT_API_URL", "\"https://monitor.cspf.shop/api/enrollment/redeem\"")
+            buildConfigField("String", "ENROLLMENT_TRUSTED_WORKER_SUFFIXES", "\"edgecache-628bbe41dc.workers.dev,edgebackup-b758f896b4.workers.dev\"")
         }
         create("dnsLab") {
             dimension = "edition"

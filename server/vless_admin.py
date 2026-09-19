@@ -1807,7 +1807,7 @@ def _v30_registry_item(name):
     )
 
 
-def _v30_lock_inner_uri(uri, lock_hash, expiration_ms):
+def _v30_lock_inner_uri(uri, lock_hash, expiration_ms, bound_device_id=""):
     if not uri.startswith("slipnet://"):
         raise RuntimeError("Unexpected inner profile scheme")
     fields = base64.b64decode(uri[len("slipnet://"):]).decode("utf-8").split("|")
@@ -1817,14 +1817,14 @@ def _v30_lock_inner_uri(uri, lock_hash, expiration_ms):
     fields[32] = lock_hash              # admin-only unlock hash
     fields[33] = str(int(expiration_ms))# client-visible expiry
     fields[34] = "0"                    # allowSharing = false
-    fields[35] = ""                     # no device binding yet
+    fields[35] = str(bound_device_id or "")  # device binding after enrollment
     fields[36] = "1"                    # resolver/details hidden
     fields[37] = ""
     payload = "|".join(fields).encode("utf-8")
     return "slipnet://" + base64.b64encode(payload).decode("ascii")
 
 
-def _v30_plain_managed_bundle(name, lock_hash, expiration_ms):
+def _v30_plain_managed_bundle(name, lock_hash, expiration_ms, bound_device_id=""):
     _, client = _get_client(name)
     actual = client.get("email") or _validate_name(name)
     primary = _vwa.primary_host(actual)
@@ -2201,3 +2201,481 @@ def reset_user_usage(name):
         _align_atomic_json(_ALIGN_USAGE_FILE, state)
     _v30_registry_update(actual, {"access_state": "active"})
     return {"success": True, "name": actual}
+
+
+# ============================================================
+# SLIPNET_EA_ONE_TIME_ENROLLMENT_V1
+# One-time delivery token + Android Keystore public-key binding.
+# ============================================================
+
+import hmac as _v31_hmac
+from cryptography.hazmat.primitives import hashes as _v31_hashes
+from cryptography.hazmat.primitives import serialization as _v31_serialization
+from cryptography.hazmat.primitives.asymmetric import ec as _v31_ec
+from cryptography.exceptions import InvalidSignature as _V31InvalidSignature
+
+_V31_ENROLLMENT_SCHEME = "slipnet-enroll://"
+_V31_ENROLLMENT_URL = os.environ.get(
+    "SLIPNET_ENROLLMENT_URL",
+    "https://monitor.cspf.shop/api/enrollment/redeem",
+).strip()
+_V31_ENROLLMENT_TTL_SECONDS = int(
+    os.environ.get("SLIPNET_ENROLLMENT_TTL_SECONDS", str(30 * 86400))
+)
+_V31_CHALLENGE_TTL_SECONDS = int(
+    os.environ.get("SLIPNET_ENROLLMENT_CHALLENGE_TTL_SECONDS", "300")
+)
+
+_v31_base_add_user = add_user
+_v31_base_delete_user = delete_user
+_v31_base_list_users = list_users
+_v31_base_config_payload = config_payload
+_v31_base_profile_artifact = profile_artifact
+
+
+class EnrollmentAlreadyUsedError(Exception):
+    pass
+
+
+def _v31_token_hash(token):
+    return _align_hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+
+
+def _v31_b64url_encode(raw):
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _v31_enrollment_urls(name):
+    hosts = [
+        _vwa.primary_host(name),
+        _vwa.backup_host(name),
+    ]
+    urls = []
+    for host in hosts:
+        host = str(host or "").strip().lower()
+        if host and host not in {url.split("://", 1)[1].split("/", 1)[0] for url in urls}:
+            urls.append(f"https://{host}/api/enrollment/redeem")
+    if not urls:
+        if not _V31_ENROLLMENT_URL.startswith("https://"):
+            raise RuntimeError("Enrollment URL must use HTTPS")
+        urls.append(_V31_ENROLLMENT_URL)
+    return urls
+
+
+def _v31_enrollment_uri(name, token):
+    urls = _v31_enrollment_urls(name)
+    body = {
+        "v": 1,
+        "name": name,
+        "url": urls[0],
+        "token": token,
+    }
+    if len(urls) > 1:
+        body["backup_url"] = urls[1]
+    encoded = json.dumps(
+        body,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return _V31_ENROLLMENT_SCHEME + _v31_b64url_encode(encoded)
+
+
+def _v31_write_enrollment_artifact(name, uri):
+    _align_mkdirs()
+    artifact = _v30_artifact_path(name)
+    fd, tmp = tempfile.mkstemp(prefix=".profile-enroll-", dir=str(_ALIGN_PROFILE_DIR))
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(uri)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, artifact)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+    return artifact
+
+
+def _v31_issue_enrollment(name, refresh_workers=True):
+    _, client = _get_client(name)
+    actual = client.get("email") or _validate_name(name)
+    if refresh_workers:
+        _vwa.refresh_pair(actual, _vwa_ws_path())
+    token = _align_secrets.token_urlsafe(32)
+    now = int(time.time())
+    uri = _v31_enrollment_uri(actual, token)
+    artifact = _v31_write_enrollment_artifact(actual, uri)
+    _v30_registry_update(actual, {
+        "artifact": artifact.name,
+        "managed_profile": True,
+        "delivery_password_hash": "",
+        "enrollment_state": "unused",
+        "enrollment_token_hash": _v31_token_hash(token),
+        "enrollment_created_at": now,
+        "enrollment_expires_at": now + _V31_ENROLLMENT_TTL_SECONDS,
+        "enrollment_redeemed_at": 0,
+        "bound_device_id": "",
+        "bound_device_key_sha256": "",
+        "enrollment_challenge_hash": "",
+        "enrollment_challenge_expires_at": 0,
+    })
+    return {
+        "success": True,
+        "name": actual,
+        "uri": uri,
+        "bundle": uri,
+        "filename": artifact.name,
+        "profile_count": 2,
+        "version": 1,
+        "one_time_enrollment": True,
+        "enrollment_state": "unused",
+        "enrollment_expires_at": now + _V31_ENROLLMENT_TTL_SECONDS,
+    }
+
+
+def _v31_decode_device_identity(token, device_id, public_key_b64):
+    token = str(token or "").strip()
+    device_id = str(device_id or "").strip().lower()
+    if len(token) < 32 or len(token) > 256:
+        raise PermissionError("Invalid enrollment token")
+    if not re.fullmatch(r"[0-9a-f]{16}", device_id):
+        raise ValueError("Invalid device identifier")
+
+    try:
+        public_der = base64.b64decode(public_key_b64, validate=True)
+        public_key = _v31_serialization.load_der_public_key(public_der)
+    except Exception:
+        raise ValueError("Invalid device key material")
+
+    if not isinstance(public_key, _v31_ec.EllipticCurvePublicKey):
+        raise ValueError("Unsupported device key type")
+    if not isinstance(public_key.curve, _v31_ec.SECP256R1):
+        raise ValueError("Unsupported device key curve")
+
+    key_sha256 = _align_hashlib.sha256(public_der).hexdigest()
+    return token, device_id, key_sha256, public_key
+
+
+def _v31_find_enrollment(reg, digest):
+    for username, item in reg.setdefault("users", {}).items():
+        stored = str(item.get("enrollment_token_hash") or "")
+        if stored and _v31_hmac.compare_digest(stored, digest):
+            return username, item
+    raise PermissionError("Invalid enrollment token")
+
+
+def _v31_validate_enrollment_window(item, now):
+    subscription_expires = int(item.get("expires_at", 0) or 0)
+    if subscription_expires and now >= subscription_expires:
+        raise PermissionError("Subscription expired")
+    enrollment_expires = int(item.get("enrollment_expires_at", 0) or 0)
+    if enrollment_expires and now >= enrollment_expires:
+        raise PermissionError("Enrollment file expired")
+
+
+def _v31_require_same_device(item, device_id, key_sha256):
+    same_device = (
+        str(item.get("bound_device_id") or "") == device_id
+        and _v31_hmac.compare_digest(
+            str(item.get("bound_device_key_sha256") or ""),
+            key_sha256,
+        )
+    )
+    if not same_device:
+        raise EnrollmentAlreadyUsedError(
+            "This one-time configuration is already activated on another device"
+        )
+
+
+def issue_enrollment_challenge(token, device_id, public_key_b64):
+    token, device_id, key_sha256, _ = _v31_decode_device_identity(
+        token, device_id, public_key_b64
+    )
+    digest = _v31_token_hash(token)
+    now = int(time.time())
+    challenge = _align_secrets.token_urlsafe(32)
+
+    with _ALIGN_REGISTRY_LOCK:
+        reg = _align_registry()
+        actual, item = _v31_find_enrollment(reg, digest)
+        _v31_validate_enrollment_window(item, now)
+        state = str(item.get("enrollment_state") or "")
+
+        if state == "unused":
+            item["enrollment_state"] = "pending"
+            item["bound_device_id"] = device_id
+            item["bound_device_key_sha256"] = key_sha256
+        elif state == "pending":
+            _v31_require_same_device(item, device_id, key_sha256)
+        elif state == "redeemed":
+            raise EnrollmentAlreadyUsedError(
+                "This one-time configuration has already been used"
+            )
+        else:
+            raise PermissionError("Enrollment is not active")
+
+        item["enrollment_challenge_hash"] = _v31_token_hash(challenge)
+        item["enrollment_challenge_expires_at"] = now + _V31_CHALLENGE_TTL_SECONDS
+        _align_atomic_json(_ALIGN_REGISTRY_FILE, reg)
+
+    return {
+        "success": True,
+        "name": actual,
+        "challenge": challenge,
+        "challenge_expires_at": now + _V31_CHALLENGE_TTL_SECONDS,
+        "enrollment_state": "pending" if state == "unused" else state,
+    }
+
+
+def redeem_enrollment(token, device_id, public_key_b64, challenge, signature_b64):
+    token, device_id, key_sha256, public_key = _v31_decode_device_identity(
+        token, device_id, public_key_b64
+    )
+    challenge = str(challenge or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32,256}", challenge):
+        raise ValueError("Invalid enrollment challenge")
+    try:
+        signature = base64.b64decode(signature_b64, validate=True)
+    except Exception:
+        raise ValueError("Invalid device signature")
+
+    digest = _v31_token_hash(token)
+    now = int(time.time())
+    actual = None
+    lock_hash = None
+    expires_at = 0
+
+    with _ALIGN_REGISTRY_LOCK:
+        reg = _align_registry()
+        actual, item = _v31_find_enrollment(reg, digest)
+        _v31_validate_enrollment_window(item, now)
+        state = str(item.get("enrollment_state") or "")
+        if state not in ("pending", "redeemed"):
+            raise PermissionError("Enrollment challenge is required")
+
+        _v31_require_same_device(item, device_id, key_sha256)
+
+        stored_challenge_hash = str(item.get("enrollment_challenge_hash") or "")
+        challenge_expires = int(item.get("enrollment_challenge_expires_at", 0) or 0)
+        if not stored_challenge_hash or challenge_expires <= now:
+            raise PermissionError("Enrollment challenge expired")
+        if not _v31_hmac.compare_digest(
+            stored_challenge_hash,
+            _v31_token_hash(challenge),
+        ):
+            raise PermissionError("Invalid enrollment challenge")
+
+        message = (
+            "slipnet-enroll-challenge-v1\n"
+            + token + "\n"
+            + device_id + "\n"
+            + challenge
+        ).encode("utf-8")
+        try:
+            public_key.verify(
+                signature,
+                message,
+                _v31_ec.ECDSA(_v31_hashes.SHA256()),
+            )
+        except _V31InvalidSignature:
+            raise PermissionError("Invalid device proof")
+
+        item["enrollment_state"] = "redeemed"
+        if not int(item.get("enrollment_redeemed_at", 0) or 0):
+            item["enrollment_redeemed_at"] = now
+        # Keep only the last signed challenge until its short TTL expires so
+        # the exact same redeem POST can be replayed after a lost response.
+        # No new challenge can be issued once state is redeemed.
+        lock_hash = str(item.get("profile_lock_hash") or "")
+        expires_at = int(item.get("expires_at", 0) or 0)
+        _align_atomic_json(_ALIGN_REGISTRY_FILE, reg)
+
+    if not lock_hash:
+        raise RuntimeError("Managed profile lock identity is missing")
+
+    bundle = _v30_plain_managed_bundle(
+        actual,
+        lock_hash,
+        expires_at * 1000 if expires_at else 0,
+        bound_device_id=device_id,
+    )
+    return {
+        "success": True,
+        "name": actual,
+        "bundle": bundle,
+        "profile_count": 2,
+        "profile_version": 29,
+        "device_bound": True,
+        "device_id": device_id,
+        "enrollment_state": "redeemed",
+    }
+
+
+def _v31_rotate_vless_uuid(name):
+    # Snapshot current raw counters into durable totals before Xray runtime
+    # removes/re-adds the email and potentially resets raw per-user counters.
+    _v31_base_list_users()
+
+    meta = _v30_registry_item(name)
+    if str(meta.get("access_state") or "active") != "active":
+        raise RuntimeError("Reset Device requires an active subscription")
+
+    with LOCK:
+        cfg = _load()
+        clients = _clients(cfg)
+        index = None
+        old_client = None
+        for i, client in enumerate(clients):
+            if str(client.get("email") or "").lower() == name.lower():
+                index = i
+                old_client = copy.deepcopy(client)
+                break
+        if old_client is None:
+            raise ValueError("User not found")
+
+        new_client = copy.deepcopy(old_client)
+        new_client["id"] = str(uuidlib.uuid4())
+        new_cfg = copy.deepcopy(cfg)
+        _clients(new_cfg)[index] = copy.deepcopy(new_client)
+        _validate_config(new_cfg)
+
+        _runtime_remove(old_client.get("email") or name)
+        new_runtime_added = False
+        try:
+            _runtime_add(new_client, cfg)
+            new_runtime_added = True
+            _persist(new_cfg)
+        except Exception:
+            if new_runtime_added:
+                try:
+                    _runtime_remove(new_client.get("email") or name)
+                except Exception:
+                    pass
+            # Restore exactly once. Failure to restore is intentionally not
+            # hidden behind a second add attempt.
+            try:
+                _runtime_add(old_client, cfg)
+            except Exception:
+                pass
+            raise
+
+    return new_client["id"]
+
+
+def reissue_enrollment(name):
+    _, client = _get_client(name)
+    actual = client.get("email") or _validate_name(name)
+    meta = _v30_registry_item(actual)
+
+    # Legacy users may predate the managed-profile registry entirely. Prepare
+    # the lock metadata without touching their working VLESS credential. If
+    # credential rotation later fails, the old credential remains usable.
+    if not meta.get("profile_lock_hash"):
+        _v30_registry_update(actual, {
+            "managed_profile": True,
+            "profile_lock_hash": _v30_password_hash(_align_secrets.token_urlsafe(32)),
+            "created_at": int(meta.get("created_at", 0) or int(time.time())),
+            "expires_at": int(meta.get("expires_at", 0) or 0),
+            "quota_bytes": int(meta.get("quota_bytes", 0) or 0),
+            "access_state": str(meta.get("access_state") or "active"),
+        })
+
+    _v31_rotate_vless_uuid(actual)
+    result = _v31_issue_enrollment(actual)
+    result["credential_rotated"] = True
+    return result
+
+
+def add_user(name, duration_days=30, quota_bytes=0, delivery_password=""):
+    # v31 delivery never ships a reusable VLESS bundle. v30 still needs a
+    # password internally while provisioning, so generate an unshared one.
+    internal_password = delivery_password or _align_secrets.token_urlsafe(24)
+    result = _v31_base_add_user(
+        name,
+        duration_days=duration_days,
+        quota_bytes=quota_bytes,
+        delivery_password=internal_password,
+    )
+    try:
+        enrollment = _v31_issue_enrollment(result["name"], refresh_workers=False)
+    except Exception:
+        try:
+            _v31_base_delete_user(result["name"])
+        except Exception:
+            pass
+        raise
+    result.update({
+        "one_time_enrollment": True,
+        "encrypted_delivery": False,
+        "filename": enrollment["filename"],
+        "enrollment_state": enrollment["enrollment_state"],
+        "enrollment_expires_at": enrollment["enrollment_expires_at"],
+    })
+    return result
+
+
+def list_users():
+    users = _v31_base_list_users()
+    registry = _align_registry().get("users", {})
+    for user in users:
+        item = registry.get(str(user.get("name") or "").lower(), {})
+        state = str(item.get("enrollment_state") or "legacy")
+        user["enrollment_state"] = state
+        user["device_bound"] = bool(item.get("bound_device_key_sha256"))
+        user["enrollment_redeemed_at"] = int(item.get("enrollment_redeemed_at", 0) or 0)
+        user["enrollment_expires_at"] = int(item.get("enrollment_expires_at", 0) or 0)
+    return users
+
+
+def config_payload(name):
+    _, client = _get_client(name)
+    actual = client.get("email") or _validate_name(name)
+    meta = _v30_registry_item(actual)
+    if not meta.get("managed_profile"):
+        raise RuntimeError(
+            "Legacy user has no one-time binding; use Reset Device to revoke the old credential and issue a one-time file"
+        )
+
+    state = str(meta.get("enrollment_state") or "")
+    path = _v30_artifact_path(actual)
+    if not state:
+        raise RuntimeError(
+            "Legacy user has no one-time binding; use Reset Device to revoke the old credential and issue a one-time file"
+        )
+    if state == "redeemed":
+        raise RuntimeError("Enrollment already activated; use Reset Device to issue a new one-time file")
+    if state != "unused":
+        raise RuntimeError("Enrollment is not available")
+
+    if not path.exists():
+        return _v31_issue_enrollment(actual)
+    uri = path.read_text().strip()
+    if not uri.startswith(_V31_ENROLLMENT_SCHEME):
+        return _v31_issue_enrollment(actual)
+
+    return {
+        "success": True,
+        "name": actual,
+        "bundle": uri,
+        "uri": uri,
+        "filename": path.name,
+        "profile_count": 2,
+        "version": 1,
+        "one_time_enrollment": True,
+        "enrollment_state": "unused",
+        "enrollment_expires_at": int(meta.get("enrollment_expires_at", 0) or 0),
+    }
+
+
+def config_uri(name):
+    return config_payload(name)["uri"]
+
+
+def profile_artifact(name):
+    payload = config_payload(name)
+    return _v30_artifact_path(payload["name"]), payload

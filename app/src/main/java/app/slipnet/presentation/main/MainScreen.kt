@@ -267,7 +267,7 @@ fun MainScreen(
     ) { result ->
         val contents = result.contents
         if (contents != null) {
-            if (contents.startsWith("slipnet://") || contents.startsWith("slipnet-enc://") || contents.startsWith("slipnet-bundle-enc://") || contents.startsWith("vless://")) {
+            if (contents.startsWith("slipnet://") || contents.startsWith("slipnet-enc://") || contents.startsWith("slipnet-bundle-enc://") || contents.startsWith("slipnet-enroll://") || contents.startsWith("vless://")) {
                 viewModel.parseImportConfig(contents)
             } else {
                 scope.launch {
@@ -826,7 +826,7 @@ fun MainScreen(
                 downloadSpeed = uiState.downloadSpeed,
                 totalUpload = uiState.trafficStats.bytesSent,
                 totalDownload = uiState.trafficStats.bytesReceived,
-                isSubscriptionUsage = uiState.activeProfile?.isLocked == true,
+                isSubscriptionUsage = uiState.trafficStats.isServerAuthoritative,
                 sleepTimerRemainingSeconds = uiState.sleepTimerRemainingSeconds,
                 onCancelSleepTimer = { viewModel.userCancelSleepTimer() },
                 dnsWarning = uiState.dnsWarning,

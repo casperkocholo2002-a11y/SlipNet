@@ -17,6 +17,12 @@ def _required_env(name):
 
 
 ORIGIN_HOST = _required_env("SLIPNET_WORKER_ORIGIN_HOST")
+ENROLLMENT_ORIGIN_HOST = os.environ.get(
+    "SLIPNET_ENROLLMENT_ORIGIN_HOST",
+    "monitor.cspf.shop",
+).strip()
+if not ENROLLMENT_ORIGIN_HOST:
+    raise RuntimeError("SLIPNET_ENROLLMENT_ORIGIN_HOST is required")
 
 PRIMARY = {
     "account_id": _required_env("SLIPNET_CF_PRIMARY_ACCOUNT_ID"),
@@ -38,9 +44,23 @@ BACKUP = {
 
 WORKER_JS = """
 const ORIGIN_HOST = __ORIGIN_HOST__;
+const ENROLLMENT_ORIGIN_HOST = __ENROLLMENT_ORIGIN_HOST__;
+const ENROLLMENT_PATHS = new Set([
+  "/api/enrollment/challenge",
+  "/api/enrollment/redeem"
+]);
 
 export default {
   async fetch(request) {
+    const url = new URL(request.url);
+
+    if (request.method === "POST" && ENROLLMENT_PATHS.has(url.pathname)) {
+      url.protocol = "https:";
+      url.hostname = ENROLLMENT_ORIGIN_HOST;
+      url.port = "443";
+      return fetch(url.toString(), request);
+    }
+
     const upgrade = request.headers.get("Upgrade");
 
     if (!upgrade || upgrade.toLowerCase() !== "websocket") {
@@ -52,7 +72,6 @@ export default {
       });
     }
 
-    const url = new URL(request.url);
     url.protocol = "https:";
     url.hostname = ORIGIN_HOST;
     url.port = "443";
@@ -60,7 +79,10 @@ export default {
     return fetch(url.toString(), request);
   }
 };
-""".replace("__ORIGIN_HOST__", json.dumps(ORIGIN_HOST))
+""".replace("__ORIGIN_HOST__", json.dumps(ORIGIN_HOST)).replace(
+    "__ENROLLMENT_ORIGIN_HOST__",
+    json.dumps(ENROLLMENT_ORIGIN_HOST),
+)
 
 
 def _run(args, timeout=45, check=True):
@@ -554,6 +576,27 @@ def backup_host(user):
         return None
 
     return item["hostname"]
+
+
+def refresh_pair(user, ws_path):
+    key = (user or "").lower()
+    refreshed = {}
+
+    for label, spec in (("primary", PRIMARY), ("backup", BACKUP)):
+        item = _read_map(spec["map_file"]).get(key)
+        if not item:
+            continue
+
+        _upload_worker(spec, item["worker"])
+        _ws_test(item["hostname"], ws_path)
+        refreshed[label] = item["hostname"]
+
+    if not refreshed:
+        raise RuntimeError(
+            f"No Worker mapping exists for {user}"
+        )
+
+    return refreshed
 
 
 def create_pair(user, ws_path):

@@ -65,6 +65,7 @@
                 <data android:scheme="slipnet" />
                 <data android:scheme="slipnet-enc" />
                 <data android:scheme="slipnet-bundle-enc" />
+                <data android:scheme="slipnet-enroll" />
                 <data android:scheme="vless" />
             </intent-filter>
             <!-- Opens app when user long-presses the Quick Settings tile -->

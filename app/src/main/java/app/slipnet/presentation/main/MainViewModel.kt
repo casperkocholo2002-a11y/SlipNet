@@ -2,6 +2,7 @@ package app.slipnet.presentation.main
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import app.slipnet.data.enrollment.EnrollmentManager
 import app.slipnet.data.export.ConfigExporter
 import app.slipnet.data.export.ConfigImporter
 import app.slipnet.data.export.ImportResult
@@ -38,6 +39,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -72,6 +75,8 @@ data class MainUiState(
     val importPreview: ImportPreview? = null,
     /** Input awaiting a password to decrypt (user pasted a slipnet-bundle-enc:// URI). */
     val pendingEncryptedImport: String? = null,
+    /** True while the first connection is claiming a one-time enrollment. */
+    val enrollmentInProgress: Boolean = false,
     val qrCodeData: QrCodeData? = null,
     val showFirstLaunchAbout: Boolean = false,
     val trafficStats: TrafficStats = TrafficStats.EMPTY,
@@ -114,6 +119,7 @@ class MainViewModel @Inject constructor(
     private val resolverScannerRepository: ResolverScannerRepository,
     private val configExporter: ConfigExporter,
     private val configImporter: ConfigImporter,
+    private val enrollmentManager: EnrollmentManager,
     private val preferencesDataStore: PreferencesDataStore
 ) : ViewModel() {
 
@@ -124,6 +130,7 @@ class MainViewModel @Inject constructor(
     private var trafficPollingJob: Job? = null
     private var sleepTimerJob: Job? = null
     private var pingJob: Job? = null
+    private val enrollmentImportMutex = Mutex()
 
     init {
         observeConnectionState()
@@ -368,7 +375,81 @@ class MainViewModel @Inject constructor(
             )
             return
         }
-        connectionManager.connect(targetProfile)
+        if (_uiState.value.enrollmentInProgress) return
+
+        viewModelScope.launch {
+            val pendingEnrollment = preferencesDataStore.getPendingEnrollment(targetProfile.id)
+            if (pendingEnrollment == null) {
+                connectionManager.connect(targetProfile)
+                return@launch
+            }
+            connectPendingEnrollment(targetProfile, pendingEnrollment)
+        }
+    }
+
+    private suspend fun connectPendingEnrollment(
+        placeholder: ServerProfile,
+        enrollment: String,
+    ) {
+        _uiState.value = _uiState.value.copy(enrollmentInProgress = true, error = null)
+
+        val bundle = enrollmentManager.redeem(enrollment).getOrElse { error ->
+            _uiState.value = _uiState.value.copy(
+                enrollmentInProgress = false,
+                error = error.message ?: "First connection activation failed",
+            )
+            return
+        }
+
+        when (val result = configImporter.parseAndImport(
+            bundle,
+            connectionManager.getDeviceId(),
+            null,
+        )) {
+            is ImportResult.Success -> {
+                val saved = mutableListOf<Pair<ServerProfile, Long>>()
+                try {
+                    for (profile in result.profiles.reversed()) {
+                        saved += profile to saveProfileUseCase(profile)
+                    }
+
+                    val primarySource = result.profiles.firstOrNull()
+                        ?: error("Enrollment returned no usable profiles")
+                    val primaryId = saved.first { it.first == primarySource }.second
+                    val primary = primarySource.copy(id = primaryId)
+
+                    setActiveProfileUseCase(primary.id)
+                    val deleted = deleteProfileUseCase(placeholder.id)
+                    deleted.exceptionOrNull()?.let { throw it }
+                    preferencesDataStore.clearPendingEnrollment(placeholder.id)
+                    _uiState.value = _uiState.value.copy(
+                        enrollmentInProgress = false,
+                        error = null,
+                    )
+                    connectionManager.connect(primary)
+                } catch (error: Exception) {
+                    for ((_, id) in saved) {
+                        runCatching { deleteProfileUseCase(id) }
+                    }
+                    _uiState.value = _uiState.value.copy(
+                        enrollmentInProgress = false,
+                        error = error.message ?: "Failed to finish first connection setup",
+                    )
+                }
+            }
+            is ImportResult.Error -> {
+                _uiState.value = _uiState.value.copy(
+                    enrollmentInProgress = false,
+                    error = result.message,
+                )
+            }
+            ImportResult.NeedsPassword -> {
+                _uiState.value = _uiState.value.copy(
+                    enrollmentInProgress = false,
+                    error = "Enrollment returned an unexpected encrypted bundle",
+                )
+            }
+        }
     }
 
     fun disconnect() {
@@ -486,7 +567,9 @@ class MainViewModel @Inject constructor(
     fun deleteProfile(profile: ServerProfile) {
         viewModelScope.launch {
             val result = deleteProfileUseCase(profile.id)
-            if (result.isFailure) {
+            if (result.isSuccess) {
+                preferencesDataStore.clearPendingEnrollment(profile.id)
+            } else {
                 _uiState.value = _uiState.value.copy(
                     error = result.exceptionOrNull()?.message ?: "Failed to delete profile"
                 )
@@ -513,7 +596,10 @@ class MainViewModel @Inject constructor(
                 }
             }
             for (id in duplicateIds) {
-                deleteProfileUseCase(id)
+                val result = deleteProfileUseCase(id)
+                if (result.isSuccess) {
+                    preferencesDataStore.clearPendingEnrollment(id)
+                }
             }
         }
     }
@@ -537,7 +623,10 @@ class MainViewModel @Inject constructor(
                 kotlinx.coroutines.delay(500)
             }
             for (profile in _uiState.value.profiles) {
-                deleteProfileUseCase(profile.id)
+                val result = deleteProfileUseCase(profile.id)
+                if (result.isSuccess) {
+                    preferencesDataStore.clearPendingEnrollment(profile.id)
+                }
             }
         }
     }
@@ -611,6 +700,65 @@ class MainViewModel @Inject constructor(
     }
 
     fun parseImportConfig(json: String, bundlePassword: String? = null) {
+        if (enrollmentManager.isEnrollmentUri(json)) {
+            val rawEnrollment = json.trim()
+            enrollmentManager.describe(rawEnrollment)
+                .onSuccess { descriptor ->
+                    viewModelScope.launch {
+                        enrollmentImportMutex.withLock {
+                            val name = descriptor.name.ifBlank { "SlipNet" }
+                            val existing = getProfilesUseCase().first().firstOrNull { profile ->
+                                profile.name == name &&
+                                    preferencesDataStore.getPendingEnrollment(profile.id) == rawEnrollment
+                            }
+                            if (existing != null) {
+                                setActiveProfileUseCase(existing.id)
+                                _uiState.value = _uiState.value.copy(error = null)
+                                return@withLock
+                            }
+
+                            var placeholderId = 0L
+                            try {
+                                val host = descriptor.endpoint
+                                    .substringAfter("://", "")
+                                    .substringBefore("/")
+                                placeholderId = saveProfileUseCase(
+                                    ServerProfile(
+                                        name = name,
+                                        domain = host,
+                                        tunnelType = TunnelType.VLESS,
+                                        vlessUuid = "",
+                                        vlessSecurity = "tls",
+                                        vlessTransport = "ws",
+                                        isLocked = true,
+                                        allowSharing = false,
+                                    )
+                                )
+                                preferencesDataStore.setPendingEnrollment(
+                                    placeholderId,
+                                    rawEnrollment,
+                                )
+                                setActiveProfileUseCase(placeholderId)
+                                _uiState.value = _uiState.value.copy(error = null)
+                            } catch (error: Exception) {
+                                if (placeholderId > 0L) {
+                                    runCatching { deleteProfileUseCase(placeholderId) }
+                                }
+                                _uiState.value = _uiState.value.copy(
+                                    error = error.message ?: "Failed to add one-time profile",
+                                )
+                            }
+                        }
+                    }
+                }
+                .onFailure { error ->
+                    _uiState.value = _uiState.value.copy(
+                        error = error.message ?: "Invalid one-time enrollment file",
+                    )
+                }
+            return
+        }
+
         val result = configImporter.parseAndImport(
             json, connectionManager.getDeviceId(), bundlePassword
         )

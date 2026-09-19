@@ -212,6 +212,28 @@ class PreferencesDataStore @Inject constructor(
         }
     }
 
+    private fun pendingEnrollmentKey(profileId: Long) =
+        stringPreferencesKey("pending_enrollment_${profileId}_v1")
+
+    suspend fun setPendingEnrollment(profileId: Long, enrollmentUri: String) {
+        require(profileId > 0L) { "Pending enrollment requires a saved profile" }
+        dataStore.edit { prefs ->
+            prefs[pendingEnrollmentKey(profileId)] = enrollmentUri
+        }
+    }
+
+    suspend fun getPendingEnrollment(profileId: Long): String? {
+        if (profileId <= 0L) return null
+        return dataStore.data.first()[pendingEnrollmentKey(profileId)]
+    }
+
+    suspend fun clearPendingEnrollment(profileId: Long) {
+        if (profileId <= 0L) return
+        dataStore.edit { prefs ->
+            prefs.remove(pendingEnrollmentKey(profileId))
+        }
+    }
+
     private fun managedUsageSentKey(profileId: Long) =
         longPreferencesKey("managed_profile_${profileId}_bytes_sent")
 
