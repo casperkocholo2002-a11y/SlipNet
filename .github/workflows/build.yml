@@ -23,11 +23,9 @@ jobs:
           java-version: '21'
           distribution: 'jetbrains'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Install Android NDK
         run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
           sdkmanager --install "ndk;29.0.14206865"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> $GITHUB_ENV
 
