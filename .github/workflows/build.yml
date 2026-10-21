@@ -141,11 +141,15 @@ jobs:
       - name: Build Lite Release APK
         run: ./gradlew assembleLiteRelease --no-daemon
 
+      - name: Build Personal / SlipNet EA Release APK
+        run: ./gradlew assemblePersonalRelease --no-daemon
+
       - name: Collect release APKs
         run: |
           mkdir -p release-apks
           cp app/build/outputs/apk/full/release/SlipNet-*-full-*.apk release-apks/ 2>/dev/null || true
           cp app/build/outputs/apk/lite/release/SlipNet-*-lite-*.apk release-apks/ 2>/dev/null || true
+          cp app/build/outputs/apk/personal/release/SlipNet-*-personal-*.apk release-apks/ 2>/dev/null || true
 
       - name: Upload Release APKs
         uses: actions/upload-artifact@v4
