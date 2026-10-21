@@ -49,7 +49,6 @@ import app.slipnet.tunnel.SlipstreamBridge
 import app.slipnet.tunnel.SlipstreamSocksBridge
 import app.slipnet.tunnel.Socks5ProxyBridge
 import app.slipnet.tunnel.VlessBridge
-import app.slipnet.tunnel.EchConfigResolver
 import app.slipnet.tunnel.EchMode
 import app.slipnet.tunnel.SnowflakeBridge
 import app.slipnet.tunnel.SshTunnelBridge
@@ -3320,11 +3319,15 @@ class SlipNetVpnService : VpnService() {
         ) {
             return PersonalEchSetup(EchMode.DISABLED, null)
         }
-        val config = EchConfigResolver.decodeStoredSeed(profile.vlessEchConfigSeed)
-        if (config == null || config.isEmpty()) {
-            throw IllegalStateException("ECH_REQUIRED stored config unavailable")
-        }
-        return PersonalEchSetup(EchMode.REQUIRED, config)
+        // Emergency compatibility hotfix:
+        // Personal authorities may remain reachable over standard TLS even when
+        // their current DNS no longer advertises a usable ECHConfigList. Do not
+        // fail closed on a stale/missing stored seed. Keep the worker hostname as
+        // the TLS/SNI authority and connect with standard TLS immediately.
+        //
+        // ECH can be re-enabled capability-first in a later release once the
+        // authority publishes a currently valid config again.
+        return PersonalEchSetup(EchMode.DISABLED, null)
     }
 
     private fun authenticatedEchSeedPersistence(profileId: Long): ((ByteArray) -> Unit)? {
