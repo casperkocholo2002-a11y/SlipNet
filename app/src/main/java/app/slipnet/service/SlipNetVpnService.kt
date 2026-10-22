@@ -3321,10 +3321,7 @@ class SlipNetVpnService : VpnService() {
             return PersonalEchSetup(EchMode.DISABLED, null)
         }
         val config = EchConfigResolver.decodeStoredSeed(profile.vlessEchConfigSeed)
-        if (config == null || config.isEmpty()) {
-            throw IllegalStateException("ECH_REQUIRED stored config unavailable")
-        }
-        return PersonalEchSetup(EchMode.REQUIRED, config)
+        return PersonalEchSetup(EchMode.PREFERRED, config)
     }
 
     private fun authenticatedEchSeedPersistence(profileId: Long): ((ByteArray) -> Unit)? {
