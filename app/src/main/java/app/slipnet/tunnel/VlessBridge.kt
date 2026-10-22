@@ -401,7 +401,9 @@ object VlessBridge {
         var tunnel: Socket? = null
         var retainedAsWarm = false
         return try {
-            tunnel = connectUpstreamTunnel(timeoutMs, timeoutMs)
+            Log.operational("DIAG_STRUCTURAL_PROBE_START")
+            tunnel = connectUpstreamTunnel(timeoutMs, timeoutMs, telemetryFlowId = 9_900_001L)
+            Log.operational("DIAG_STRUCTURAL_TLS_READY")
             val tIn = BufferedInputStream(tunnel.getInputStream())
             val tOut = tunnel.getOutputStream()
 
@@ -415,6 +417,7 @@ object VlessBridge {
                 tOut.flush()
                 val statusLine = readLine(tIn) ?: throw Exception("No WS response (wrong CDN/domain?)")
                 if ("101" !in statusLine) throw Exception("WS upgrade failed: $statusLine (check wsPath)")
+                Log.operational("DIAG_STRUCTURAL_WS_101")
                 // Drain response headers so the server finishes its write.
                 while (true) { val line = readLine(tIn) ?: break; if (line.isEmpty()) break }
 
@@ -452,7 +455,9 @@ object VlessBridge {
         if (!isRunning()) return Result.failure(IllegalStateException("VlessBridge not running"))
         var tunnel: Socket? = null
         return try {
-            tunnel = connectUpstreamTunnel(timeoutMs, timeoutMs)
+            Log.operational("DIAG_AUTH_PROBE_START")
+            tunnel = connectUpstreamTunnel(timeoutMs, timeoutMs, telemetryFlowId = 9_900_002L)
+            Log.operational("DIAG_AUTH_TLS_READY")
             tunnel.soTimeout = timeoutMs
             val input = BufferedInputStream(tunnel.getInputStream())
             val output = tunnel.getOutputStream()
@@ -466,6 +471,7 @@ object VlessBridge {
                 if ("101" !in statusLine) {
                     throw Exception("WS upgrade failed during authenticated probe: $statusLine")
                 }
+                Log.operational("DIAG_AUTH_WS_101")
                 while (true) {
                     val line = readLine(input) ?: break
                     if (line.isEmpty()) break
@@ -518,6 +524,7 @@ object VlessBridge {
                 }
                 if (payload.size < 2) throw Exception("Invalid VLESS auth response")
                 if (payload[0] != VLESS_VERSION) throw Exception("Unexpected VLESS response version")
+                Log.operational("DIAG_AUTH_VLESS_RESPONSE_OK")
                 val addonsLen = payload[1].toInt() and 0xFF
                 if (2 + addonsLen > payload.size) throw Exception("Truncated VLESS auth response")
             } else {

@@ -14,8 +14,8 @@ plugins {
 }
 
 val minSdkVersion = 24
-val appVersionName = "2.5.12"
-val appVersionCode = 87
+val appVersionName = "2.5.12-diag1"
+val appVersionCode = 8701
 val cargoProfile = (findProperty("CARGO_PROFILE") as String?) ?: run {
     val isRelease = gradle.startParameter.taskNames.any { it.contains("Release", ignoreCase = true) }
     if (isRelease) "release" else "debug"
@@ -121,8 +121,8 @@ android {
         }
         create("personal") {
             dimension = "edition"
-            applicationIdSuffix = ".personal"
-            versionNameSuffix = "-personal"
+            applicationIdSuffix = ".personaldiag"
+            versionNameSuffix = "-personal-diag"
             buildConfigField("boolean", "INCLUDE_TOR", "false")
             buildConfigField("boolean", "INCLUDE_NAIVE", "false")
             buildConfigField("boolean", "PERSONAL_BUILD", "true")
