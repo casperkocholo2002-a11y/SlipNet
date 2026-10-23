@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "routes": [
+    {
+      "id": "parspack-direct",
+      "label": "ParsPack Direct",
+      "provider": "parspack",
+      "enabled": false,
+      "host": "parspack-direct.example.com",
+      "port": 443,
+      "path": "/replace-with-public-relay-path",
+      "inbound_tag": "vless-parspack-direct"
+    },
+    {
+      "id": "arvan-direct",
+      "label": "Arvan Direct",
+      "provider": "arvan",
+      "enabled": false,
+      "host": "arvan-direct.example.com",
+      "port": 443,
+      "path": "/replace-with-public-relay-path",
+      "inbound_tag": "vless-arvan-direct"
+    }
+  ]
+}

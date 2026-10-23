@@ -2933,3 +2933,636 @@ def config_uri(name):
 def profile_artifact(name):
     payload = config_payload(name)
     return _v30_artifact_path(payload["name"]), payload
+
+
+# ============================================================
+# SLIPNET_DIRECT_ROUTE_ADMIN_V1
+# Provider-direct routes are delivered separately from the
+# strict two-profile managed enrollment pair. This preserves
+# compatibility with the existing Android enrollment validator.
+# ============================================================
+
+import direct_routes as _direct_routes
+
+
+def _direct_v29_uri(name, route):
+    _, client = _get_client(name)
+    actual = client.get("email") or _validate_name(name)
+    uid = client["id"]
+
+    host = str(route["host"])
+    path = str(route["path"])
+    port = int(route.get("port", 443))
+    route_id = str(route["id"])
+    provider = str(route.get("provider") or "direct")
+    label = re.sub(r"[^A-Za-z0-9_-]+", "-", str(route.get("label") or route_id)).strip("-")
+
+    # Direct provider routes intentionally use the existing fragmentation
+    # transport, not ECH. This keeps them separate from the managed
+    # Cloudflare Worker failure-domain pair and requires no client change.
+    fields = [
+        "29", "vless", f"DIRECT-{actual}-{label}", host, "", "0", "5000", "bbr",
+        "1080", "127.0.0.1", "0", "", "", "", "0", "", "", "22", "0",
+        "127.0.0.1", "0", "", "udp", "password", "", "", "", "0", "443", "",
+        "", "0", "", "0", "0", "", "0", "", "0", "0", "1080", "0", "txt",
+        "101", "0.0", "0", "0", "0", "0", "0", "0", "", "", "8080", "", "0",
+        "/", "1", "", "", "roundrobin", "3", uid, "tls", "ws", path,
+        host, str(port),
+        "1", "sni_split", "100", "", "0", "0", "0", "8", "", "0", host,
+        "", "", "", "", "0",
+    ]
+    if len(fields) != 84:
+        raise RuntimeError(f"Unexpected direct v29 profile layout: {len(fields)} fields")
+    payload = "|".join(fields).encode("utf-8")
+    return "slipnet://" + base64.b64encode(payload).decode("ascii")
+
+
+def direct_route_summary(name):
+    _, client = _get_client(name)
+    actual = client.get("email") or _validate_name(name)
+    summary = _direct_routes.user_summary(actual)
+    meta = _v30_registry_item(actual)
+    summary["device_bound"] = bool(meta.get("bound_device_id"))
+    summary["access_state"] = str(meta.get("access_state") or "active")
+    summary["enrollment_state"] = str(meta.get("enrollment_state") or "legacy")
+    return summary
+
+
+def set_direct_routes(name, route_ids):
+    _, client = _get_client(name)
+    actual = client.get("email") or _validate_name(name)
+    result = _direct_routes.set_user_routes(actual, route_ids)
+    result["apply_on_next_download"] = True
+    return result
+
+
+def set_direct_route_enabled(route_id, enabled):
+    return _direct_routes.set_route_enabled(route_id, enabled)
+
+
+def list_direct_routes():
+    return {
+        "success": True,
+        "routes": _direct_routes.list_routes(include_private=False),
+    }
+
+
+def direct_config_payload(name):
+    _, client = _get_client(name)
+    actual = client.get("email") or _validate_name(name)
+    meta = _v30_registry_item(actual)
+
+    if str(meta.get("access_state") or "active") != "active":
+        raise RuntimeError("Subscription is not active")
+
+    if not meta.get("managed_profile"):
+        raise RuntimeError("User is not managed by the current EA subscription authority")
+
+    routes = _direct_routes.routes_for_user(actual)
+    if not routes:
+        raise RuntimeError("No enabled direct routes are assigned to this user")
+
+    lock_hash = str(meta.get("profile_lock_hash") or "")
+    if not lock_hash:
+        raise RuntimeError("Managed profile lock identity is missing")
+
+    expires_at = int(meta.get("expires_at", 0) or 0)
+    expiration_ms = expires_at * 1000 if expires_at else 0
+    bound_device_id = str(meta.get("bound_device_id") or "")
+
+    uris = []
+    route_ids = []
+    for route in routes:
+        uri = _direct_v29_uri(actual, route)
+        uri = _v30_lock_inner_uri(
+            uri,
+            lock_hash,
+            expiration_ms,
+            bound_device_id=bound_device_id,
+        )
+        uris.append(uri)
+        route_ids.append(route["id"])
+
+    bundle = "\n".join(uris) + "\n"
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", actual)
+
+    return {
+        "success": True,
+        "name": actual,
+        "bundle": bundle,
+        "filename": safe + ".direct.slipnet",
+        "profile_count": len(uris),
+        "profile_version": 29,
+        "route_ids": route_ids,
+        "device_bound": bool(bound_device_id),
+    }
+
+
+def direct_profile_artifact(name):
+    # Compatibility helper: Direct bundles are generated in memory and are
+    # intentionally not persisted as plaintext artifacts on the server.
+    payload = direct_config_payload(name)
+    return payload["bundle"].encode("utf-8"), payload
+
+
+_direct_routes_base_delete_user = delete_user
+
+
+def delete_user(name):
+    _, client = _get_client(name)
+    actual = client.get("email") or name
+    result = _direct_routes_base_delete_user(actual)
+    try:
+        _direct_routes.drop_user(actual)
+    except Exception as exc:
+        result["direct_route_warning"] = str(exc)[:300]
+    return result
+
+
+# ============================================================
+# DIRECT_XRAY_MEMBERSHIP_V2
+# Route assignment is enforced in Xray, not just in the UI.
+# Each provider-direct route owns a dedicated inbound tag.
+# ============================================================
+
+def _dx_routes_by_id():
+    return {
+        route["id"]: route
+        for route in _direct_routes.list_routes(include_private=True)
+    }
+
+
+def _dx_inbound(cfg, tag):
+    for inbound in cfg.get("inbounds", []):
+        if inbound.get("tag") == tag:
+            return inbound
+    raise RuntimeError(f"Direct Xray inbound not found: {tag}")
+
+
+def _dx_clients(cfg, tag):
+    return (
+        _dx_inbound(cfg, tag)
+        .setdefault("settings", {})
+        .setdefault("clients", [])
+    )
+
+
+def _dx_client_by_email(clients, email):
+    target = str(email or "").lower()
+    for client in clients:
+        if str(client.get("email") or "").lower() == target:
+            return client
+    return None
+
+
+def _dx_main_client(cfg, name):
+    client = _dx_client_by_email(_clients(cfg), name)
+    if client is None:
+        raise ValueError("User not found")
+    return client
+
+
+def _dx_runtime_add(client, source_cfg, tag):
+    inbound = copy.deepcopy(_dx_inbound(source_cfg, tag))
+    inbound.setdefault("settings", {})["clients"] = [copy.deepcopy(client)]
+    path = _write_temp_json({"inbounds": [inbound]})
+    try:
+        proc = _run([
+            XRAY, "api", "adu",
+            "--server=" + API,
+            path,
+        ])
+        output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        if proc.returncode != 0 or "Added 1 user(s)" not in output:
+            raise RuntimeError(
+                output.strip() or f"Runtime add failed for direct inbound {tag}"
+            )
+    finally:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+def _dx_runtime_remove(email, tag):
+    proc = _run([
+        XRAY, "api", "rmu",
+        "--server=" + API,
+        "-tag=" + tag,
+        email,
+    ])
+    output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    if proc.returncode != 0 or "Removed 1 user(s)" not in output:
+        raise RuntimeError(
+            output.strip() or f"Runtime remove failed for direct inbound {tag}"
+        )
+
+
+def _dx_rollback_runtime(executed, source_cfg):
+    errors = []
+    for action, tag, client in reversed(executed):
+        email = client.get("email") or ""
+        try:
+            if action == "add":
+                _dx_runtime_remove(email, tag)
+            else:
+                _dx_runtime_add(client, source_cfg, tag)
+        except Exception as exc:
+            errors.append(f"{action}:{tag}:{email}: {exc}")
+    return errors
+
+
+def _dx_execute_runtime(actions, source_cfg):
+    executed = []
+    try:
+        for action, tag, client in actions:
+            if action == "add":
+                _dx_runtime_add(client, source_cfg, tag)
+            elif action == "remove":
+                _dx_runtime_remove(client.get("email") or "", tag)
+            else:
+                raise RuntimeError(f"Unknown direct runtime action: {action}")
+            executed.append((action, tag, copy.deepcopy(client)))
+    except Exception as exc:
+        rollback_errors = _dx_rollback_runtime(executed, source_cfg)
+        if rollback_errors:
+            raise RuntimeError(
+                "Direct runtime mutation failed and rollback was incomplete: "
+                + "; ".join(rollback_errors)
+            ) from exc
+        raise
+    return executed
+
+
+def _dx_restore_config_and_runtime(old_cfg, executed):
+    errors = _dx_rollback_runtime(executed, old_cfg)
+    try:
+        _persist(old_cfg)
+    except Exception as exc:
+        errors.append("config: " + str(exc))
+    return errors
+
+
+def _dx_reconcile_user_routes(name, assigned_route_ids, write_state=True):
+    assigned_route_ids = list(dict.fromkeys(
+        str(value).strip().lower()
+        for value in (assigned_route_ids or [])
+        if str(value).strip()
+    ))
+    definitions = _dx_routes_by_id()
+    unknown = [route_id for route_id in assigned_route_ids if route_id not in definitions]
+    if unknown:
+        raise ValueError("Unknown direct route: " + ", ".join(unknown))
+
+    enabled = {
+        route["id"]
+        for route in _direct_routes.enabled_routes(include_private=True)
+    }
+    desired_active = set(assigned_route_ids) & enabled
+
+    with LOCK:
+        cfg = _load()
+        main_client = copy.deepcopy(_dx_main_client(cfg, name))
+        actual = main_client.get("email") or _validate_name(name)
+        old_assignment = _direct_routes.assigned_route_ids(actual)
+        new_cfg = copy.deepcopy(cfg)
+        actions = []
+
+        for route_id, route in definitions.items():
+            tag = route["inbound_tag"]
+            desired = route_id in desired_active
+            try:
+                current_clients = _dx_clients(cfg, tag)
+                new_clients = _dx_clients(new_cfg, tag)
+            except RuntimeError:
+                if desired:
+                    raise RuntimeError(
+                        f"Direct route {route_id} is enabled but Xray inbound {tag} is missing"
+                    )
+                continue
+
+            current = _dx_client_by_email(current_clients, actual)
+            new_clients[:] = [
+                client
+                for client in new_clients
+                if str(client.get("email") or "").lower() != actual.lower()
+            ]
+
+            if desired:
+                new_clients.append(copy.deepcopy(main_client))
+
+            if current is None and desired:
+                actions.append(("add", tag, copy.deepcopy(main_client)))
+            elif current is not None and not desired:
+                actions.append(("remove", tag, copy.deepcopy(current)))
+            elif current is not None and desired:
+                if str(current.get("id") or "") != str(main_client.get("id") or ""):
+                    actions.append(("remove", tag, copy.deepcopy(current)))
+                    actions.append(("add", tag, copy.deepcopy(main_client)))
+
+        _validate_config(new_cfg)
+        executed = _dx_execute_runtime(actions, cfg)
+        persisted = False
+        try:
+            _persist(new_cfg)
+            persisted = True
+            if write_state:
+                _direct_routes.set_user_routes(actual, assigned_route_ids)
+        except Exception as exc:
+            rollback_errors = _dx_rollback_runtime(executed, cfg)
+            if persisted:
+                try:
+                    _persist(cfg)
+                except Exception as rollback_exc:
+                    rollback_errors.append("config: " + str(rollback_exc))
+            if write_state:
+                try:
+                    _direct_routes.set_user_routes(actual, old_assignment)
+                except Exception as rollback_exc:
+                    rollback_errors.append("route-state: " + str(rollback_exc))
+            if rollback_errors:
+                raise RuntimeError(
+                    "Direct route update failed and rollback was incomplete: "
+                    + "; ".join(rollback_errors)
+                ) from exc
+            raise
+
+    return {
+        "success": True,
+        "name": actual,
+        "route_ids": assigned_route_ids,
+        "active_route_ids": [
+            route_id for route_id in assigned_route_ids if route_id in enabled
+        ],
+        "enforced": True,
+    }
+
+
+def set_direct_routes(name, route_ids):
+    return _dx_reconcile_user_routes(name, route_ids, write_state=True)
+
+
+def _dx_sync_global_route(route_id, enabled):
+    route_id = str(route_id or "").strip().lower()
+    definitions = _dx_routes_by_id()
+    route = definitions.get(route_id)
+    if route is None:
+        raise ValueError("Unknown direct route")
+
+    old_route = next(
+        (item for item in _direct_routes.list_routes() if item["id"] == route_id),
+        None,
+    )
+    old_enabled = bool(old_route and old_route.get("enabled"))
+    tag = route["inbound_tag"]
+
+    with LOCK:
+        cfg = _load()
+        main_clients = {
+            str(client.get("email") or "").lower(): copy.deepcopy(client)
+            for client in _clients(cfg)
+            if client.get("email")
+        }
+
+        try:
+            current_clients = _dx_clients(cfg, tag)
+        except RuntimeError:
+            if enabled:
+                raise RuntimeError(
+                    f"Cannot enable {route_id}: Xray inbound {tag} is missing"
+                )
+            _direct_routes.set_route_enabled(route_id, False)
+            return {
+                "success": True,
+                "route_id": route_id,
+                "enabled": False,
+                "enforced": True,
+            }
+
+        desired_emails = set()
+        if enabled:
+            for email in main_clients:
+                if route_id in _direct_routes.assigned_route_ids(email):
+                    desired_emails.add(email)
+
+        new_cfg = copy.deepcopy(cfg)
+        new_clients = _dx_clients(new_cfg, tag)
+        unmanaged = [
+            copy.deepcopy(client)
+            for client in current_clients
+            if str(client.get("email") or "").lower() not in main_clients
+        ]
+        desired_clients = [
+            copy.deepcopy(main_clients[email])
+            for email in sorted(desired_emails)
+        ]
+        new_clients[:] = unmanaged + desired_clients
+
+        actions = []
+        current_managed = {
+            str(client.get("email") or "").lower(): copy.deepcopy(client)
+            for client in current_clients
+            if str(client.get("email") or "").lower() in main_clients
+        }
+        for email, current in current_managed.items():
+            desired = main_clients.get(email) if email in desired_emails else None
+            if desired is None:
+                actions.append(("remove", tag, current))
+            elif str(current.get("id") or "") != str(desired.get("id") or ""):
+                actions.append(("remove", tag, current))
+                actions.append(("add", tag, desired))
+
+        for email in sorted(desired_emails):
+            if email not in current_managed:
+                actions.append(("add", tag, main_clients[email]))
+
+        _validate_config(new_cfg)
+        executed = _dx_execute_runtime(actions, cfg)
+        persisted = False
+        try:
+            _persist(new_cfg)
+            persisted = True
+            _direct_routes.set_route_enabled(route_id, enabled)
+        except Exception as exc:
+            rollback_errors = _dx_rollback_runtime(executed, cfg)
+            if persisted:
+                try:
+                    _persist(cfg)
+                except Exception as rollback_exc:
+                    rollback_errors.append("config: " + str(rollback_exc))
+            try:
+                _direct_routes.set_route_enabled(route_id, old_enabled)
+            except Exception as rollback_exc:
+                rollback_errors.append("route-state: " + str(rollback_exc))
+            if rollback_errors:
+                raise RuntimeError(
+                    "Direct global route update failed and rollback was incomplete: "
+                    + "; ".join(rollback_errors)
+                ) from exc
+            raise
+
+    return {
+        "success": True,
+        "route_id": route_id,
+        "enabled": bool(enabled),
+        "enforced": True,
+        "managed_members": len(desired_emails),
+    }
+
+
+def set_direct_route_enabled(route_id, enabled):
+    return _dx_sync_global_route(route_id, bool(enabled))
+
+
+def _dx_verify_user_memberships(name, routes):
+    cfg = _load()
+    main_client = _dx_main_client(cfg, name)
+    actual = main_client.get("email") or _validate_name(name)
+    expected_uuid = str(main_client.get("id") or "")
+    for route in routes:
+        tag = route["inbound_tag"]
+        client = _dx_client_by_email(_dx_clients(cfg, tag), actual)
+        if client is None:
+            raise RuntimeError(
+                f"Direct route {route['id']} is assigned but not active in Xray"
+            )
+        if str(client.get("id") or "") != expected_uuid:
+            raise RuntimeError(
+                f"Direct route {route['id']} has stale user credentials"
+            )
+
+
+_dx_base_direct_config_payload = direct_config_payload
+
+
+def direct_config_payload(name):
+    _, client = _get_client(name)
+    actual = client.get("email") or _validate_name(name)
+    meta = _v30_registry_item(actual)
+    bound_device_id = str(meta.get("bound_device_id") or "")
+    if not bound_device_id:
+        raise RuntimeError(
+            "Activate the one-time EA enrollment on the target device before downloading Direct routes"
+        )
+    routes = _direct_routes.routes_for_user(actual)
+    if not routes:
+        raise RuntimeError("No enabled direct routes are assigned to this user")
+    _dx_verify_user_memberships(actual, routes)
+    return _dx_base_direct_config_payload(actual)
+
+
+def _dx_refresh_user_uuid(name):
+    with LOCK:
+        cfg = _load()
+        main_client = copy.deepcopy(_dx_main_client(cfg, name))
+        actual = main_client.get("email") or _validate_name(name)
+        new_cfg = copy.deepcopy(cfg)
+        actions = []
+
+        for route in _dx_routes_by_id().values():
+            tag = route["inbound_tag"]
+            try:
+                current = _dx_client_by_email(_dx_clients(cfg, tag), actual)
+                new_clients = _dx_clients(new_cfg, tag)
+            except RuntimeError:
+                continue
+            if current is None:
+                continue
+            if str(current.get("id") or "") == str(main_client.get("id") or ""):
+                continue
+            new_clients[:] = [
+                client for client in new_clients
+                if str(client.get("email") or "").lower() != actual.lower()
+            ]
+            new_clients.append(copy.deepcopy(main_client))
+            actions.append(("remove", tag, copy.deepcopy(current)))
+            actions.append(("add", tag, copy.deepcopy(main_client)))
+
+        if not actions:
+            return {"success": True, "updated_routes": 0}
+
+        _validate_config(new_cfg)
+        executed = _dx_execute_runtime(actions, cfg)
+        persisted = False
+        try:
+            _persist(new_cfg)
+            persisted = True
+        except Exception as exc:
+            rollback_errors = _dx_rollback_runtime(executed, cfg)
+            if persisted:
+                try:
+                    _persist(cfg)
+                except Exception as rollback_exc:
+                    rollback_errors.append("config: " + str(rollback_exc))
+            if rollback_errors:
+                raise RuntimeError(
+                    "Direct credential sync failed and rollback was incomplete: "
+                    + "; ".join(rollback_errors)
+                ) from exc
+            raise
+
+    return {"success": True, "updated_routes": len(actions) // 2}
+
+
+_dx_base_replace_vless_uuid = _v31_replace_vless_uuid
+
+
+def _v31_replace_vless_uuid(name, replacement_uuid, snapshot_usage=True):
+    old_uuid, new_uuid = _dx_base_replace_vless_uuid(
+        name,
+        replacement_uuid,
+        snapshot_usage=snapshot_usage,
+    )
+    try:
+        _dx_refresh_user_uuid(name)
+    except Exception as exc:
+        rollback_errors = []
+        try:
+            _dx_base_replace_vless_uuid(
+                name,
+                old_uuid,
+                snapshot_usage=False,
+            )
+        except Exception as rollback_exc:
+            rollback_errors.append("main-credential: " + str(rollback_exc))
+        if rollback_errors:
+            raise RuntimeError(
+                "Direct credential sync failed and main credential rollback was incomplete: "
+                + "; ".join(rollback_errors)
+            ) from exc
+        raise
+    return old_uuid, new_uuid
+
+
+_dx_base_delete_user = _direct_routes_base_delete_user
+
+
+def delete_user(name):
+    if not _dx_routes_by_id():
+        return _dx_base_delete_user(name)
+
+    _, client = _get_client(name)
+    actual = client.get("email") or _validate_name(name)
+    old_assignment = _direct_routes.assigned_route_ids(actual)
+
+    _dx_reconcile_user_routes(actual, [], write_state=True)
+    try:
+        result = _dx_base_delete_user(actual)
+    except Exception as exc:
+        rollback_errors = []
+        try:
+            _dx_reconcile_user_routes(actual, old_assignment, write_state=True)
+        except Exception as rollback_exc:
+            rollback_errors.append("direct-membership: " + str(rollback_exc))
+        if rollback_errors:
+            raise RuntimeError(
+                "User deletion failed and Direct membership rollback was incomplete: "
+                + "; ".join(rollback_errors)
+            ) from exc
+        raise
+
+    try:
+        _direct_routes.drop_user(actual)
+    except Exception as exc:
+        result["direct_route_warning"] = str(exc)[:300]
+    return result

@@ -940,6 +940,21 @@ header {
 </header>
 
 
+<!-- DIRECT_ROUTE_ADMIN_V1 -->
+<div class="vless-admin">
+  <div class="vless-admin-head">
+    <div>
+      <div class="vless-admin-title">Direct Route Manager</div>
+      <div class="vless-admin-sub">ParsPack Direct · Arvan Direct · provider route state</div>
+    </div>
+    <button class="vless-add-btn" onclick="loadDirectRoutes()">Refresh Routes</button>
+  </div>
+  <div id="direct-route-list">
+    <div class="vless-loading">Loading direct routes...</div>
+  </div>
+  <div class="vless-admin-msg" id="direct-route-msg"></div>
+</div>
+
 <!-- VLESS_ADMIN_PANEL_V1 -->
 <div class="vless-admin">
   <div class="vless-admin-head">
@@ -1361,6 +1376,100 @@ async function downloadVlessConfig(name) {
 
 
 <script>
+/* DIRECT_ROUTE_ADMIN_JS_V1 */
+function directMsg(text) {
+  const el = document.getElementById('direct-route-msg');
+  if (el) el.textContent = text || '';
+}
+
+async function loadDirectRoutes() {
+  try {
+    const r = await fetch('/api/direct/routes', {cache:'no-store'});
+    const result = await r.json();
+    if (!r.ok || !result.success) throw new Error(result.error || 'Route load failed');
+    const el = document.getElementById('direct-route-list');
+    if (!result.routes.length) {
+      el.innerHTML = '<div class="vless-loading">No direct routes configured yet</div>';
+      return;
+    }
+    el.innerHTML = result.routes.map(route =>
+      '<div class="vless-user-row">' +
+        '<div><div class="vless-user-name">' + vlessEsc(route.label) + '</div>' +
+        '<div class="vless-user-state">' + vlessEsc(route.provider) + ' · ' + vlessEsc(route.host) + ':' + vlessEsc(route.port) + '</div></div>' +
+        '<div class="vless-actions"><button class="vless-action-btn" data-route="' + vlessEsc(route.id) + '" onclick="setDirectRouteState(this.dataset.route,' + (!route.enabled) + ')">' +
+        (route.enabled ? 'Disable' : 'Enable') + '</button></div></div>'
+    ).join('');
+  } catch (e) { directMsg('Route load failed: ' + e.message); }
+}
+
+async function setDirectRouteState(routeId, enabled) {
+  try {
+    const r = await fetch('/api/direct/route-state', {
+      method:'POST', headers:{'Content-Type':'application/json','X-Requested-With':'SlipNetMonitor'},
+      body:JSON.stringify({route_id:routeId, enabled})
+    });
+    const result = await r.json();
+    if (!r.ok || !result.success) throw new Error(result.error || 'Route update failed');
+    directMsg(routeId + (enabled ? ' enabled' : ' disabled'));
+    await loadDirectRoutes();
+  } catch (e) { directMsg('Route update failed: ' + e.message); }
+}
+
+async function editDirectRoutes(name) {
+  try {
+    const r = await fetch('/api/direct/routes?user=' + encodeURIComponent(name), {cache:'no-store'});
+    const result = await r.json();
+    if (!r.ok || !result.success) throw new Error(result.error || 'User route load failed');
+    const routes = result.routes || [];
+    if (!routes.length) { vlessMsg('No direct routes are configured'); return; }
+    const choices = routes.map(x =>
+      x.id + ' = ' + x.label + (x.enabled ? '' : ' [globally disabled]')
+    ).join('\\n');
+    const raw = prompt('Direct routes for ' + name + ':\\n' + choices + '\\n\\nComma-separated route ids:', (result.assigned_route_ids || []).join(','));
+    if (raw === null) return;
+    const routeIds = raw.split(',').map(x => x.trim()).filter(Boolean);
+    const save = await fetch('/api/direct/user-routes', {
+      method:'POST', headers:{'Content-Type':'application/json','X-Requested-With':'SlipNetMonitor'},
+      body:JSON.stringify({name, route_ids:routeIds})
+    });
+    const saved = await save.json();
+    if (!save.ok || !saved.success) throw new Error(saved.error || 'User route update failed');
+    vlessMsg('Direct routes updated for ' + name);
+  } catch (e) { vlessMsg('Direct route update failed: ' + e.message); }
+}
+
+async function downloadDirectConfig(name) {
+  try {
+    const r = await fetch('/api/direct/download?user=' + encodeURIComponent(name), {
+      cache:'no-store'
+    });
+    if (!r.ok) {
+      let message = 'Direct download failed';
+      try {
+        const payload = await r.json();
+        message = payload.error || message;
+      } catch (_) {}
+      throw new Error(message);
+    }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name + '.direct.slipnet';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    vlessMsg('Direct-route bundle downloaded for ' + name);
+  } catch (e) {
+    vlessMsg('Direct download failed: ' + e.message);
+  }
+}
+
+loadDirectRoutes();
+</script>
+
+<script>
 /* VLESS_ACTIVITY_UI_V2 */
 
 function activityChip(a) {
@@ -1504,6 +1613,10 @@ function renderVlessUsersFromData(users, degraded=false, error='') {
           <div class="vless-actions">
             ${deliveryActions}
             <button class="vless-action-btn"
+              onclick="editDirectRoutes('${vlessEsc(u.name)}')">Direct Routes</button>
+            <button class="vless-action-btn"
+              onclick="downloadDirectConfig('${vlessEsc(u.name)}')">Download Directs</button>
+            <button class="vless-action-btn"
               onclick="editVlessLimits('${vlessEsc(u.name)}')">Limits</button>
             <button class="vless-action-btn"
               onclick="resetVlessUsage('${vlessEsc(u.name)}')">Reset Usage</button>
@@ -1614,6 +1727,46 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if not self.check_auth():
+            return
+
+        if parsed.path == '/api/direct/routes':
+            try:
+                qs = parse_qs(parsed.query)
+                username = qs.get("user", [""])[0]
+                payload = (
+                    vless_admin.direct_route_summary(username)
+                    if username
+                    else vless_admin.list_direct_routes()
+                )
+                self.send_json(payload)
+            except Exception as e:
+                self.send_json({"success": False, "error": str(e)[:500]}, 400)
+            return
+
+        if parsed.path == '/api/direct/config':
+            try:
+                qs = parse_qs(parsed.query)
+                username = qs.get("user", [""])[0]
+                self.send_json(vless_admin.direct_config_payload(username))
+            except Exception as e:
+                self.send_json({"success": False, "error": str(e)[:500]}, 400)
+            return
+
+        if parsed.path == '/api/direct/download':
+            try:
+                qs = parse_qs(parsed.query)
+                username = qs.get("user", [""])[0]
+                payload = vless_admin.direct_config_payload(username)
+                content = payload["bundle"].encode("utf-8")
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/plain; charset=utf-8')
+                self.send_header('Content-Disposition', 'attachment; filename="' + payload["filename"] + '"')
+                self.send_header('Content-Length', str(len(content)))
+                self.send_header('Cache-Control', 'no-store')
+                self.end_headers()
+                self.wfile.write(content)
+            except Exception as e:
+                self.send_json({"success": False, "error": str(e)[:500]}, 400)
             return
 
         if parsed.path == '/api/vless/users':
@@ -1771,6 +1924,8 @@ class Handler(BaseHTTPRequestHandler):
             '/api/vless/limits',
             '/api/vless/reset-usage',
             '/api/vless/reissue',
+            '/api/direct/user-routes',
+            '/api/direct/route-state',
         ):
 
             if self.headers.get('X-Requested-With') != 'SlipNetMonitor':
@@ -1810,8 +1965,17 @@ class Handler(BaseHTTPRequestHandler):
                     result = vless_admin.reset_user_usage(username)
                 elif parsed.path == '/api/vless/reissue':
                     result = vless_admin.reissue_enrollment(username)
+                elif parsed.path == '/api/direct/user-routes':
+                    result = vless_admin.set_direct_routes(
+                        username, payload.get("route_ids", [])
+                    )
+                elif parsed.path == '/api/direct/route-state':
+                    result = vless_admin.set_direct_route_enabled(
+                        payload.get("route_id", ""),
+                        bool(payload.get("enabled")),
+                    )
                 else:
-                    raise RuntimeError("Unsupported VLESS admin operation")
+                    raise RuntimeError("Unsupported admin operation")
 
                 self.send_json(result)
 
